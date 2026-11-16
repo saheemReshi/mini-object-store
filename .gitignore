@@ -1,0 +1,22 @@
+# Local storage
+data/
+tmp/
+
+# SQLite databases (added later)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Environment and secrets
+.env
+.env.*
+
+# Go build/test artifacts
+*.test
+coverage.out
+
+# Editor files
+.vscode/
+.idea/
