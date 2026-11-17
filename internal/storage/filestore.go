@@ -22,12 +22,16 @@ type ChunkInfo struct {
 	ID   string `json:"chunk_id"`
 	Size int64  `json:"size"`
 }
+type chunkLock struct {
+	mu   sync.RWMutex
+	refs int
+}
 
 type FileStore struct {
 	rootDir string
 
 	locksMu    sync.Mutex
-	chunkLocks map[string]*sync.RWMutex
+	chunkLocks map[string]*chunkLock
 }
 
 func NewFileStore(rootDir string) (*FileStore, error) {
@@ -39,22 +43,48 @@ func NewFileStore(rootDir string) (*FileStore, error) {
 
 	return &FileStore{
 		rootDir:    rootDir,
-		chunkLocks: make(map[string]*sync.RWMutex),
+		chunkLocks: make(map[string]*chunkLock),
 	}, nil
 }
 
-func (s *FileStore) lockFor(id string) *sync.RWMutex {
+func (s *FileStore) lockChunk(id string, write bool) func() {
+	// Step 1: Obtain a reference to the chunk lock.
 	s.locksMu.Lock()
-	defer s.locksMu.Unlock()
 
-	if mu, exists := s.chunkLocks[id]; exists {
-		return mu
+	entry, exists := s.chunkLocks[id]
+	if !exists {
+		entry = &chunkLock{}
+		s.chunkLocks[id] = entry
 	}
 
-	mu := &sync.RWMutex{}
-	s.chunkLocks[id] = mu
+	entry.refs++
+	s.locksMu.Unlock()
 
-	return mu
+	// Step 2: Acquire the actual chunk lock.
+	if write {
+		entry.mu.Lock()
+	} else {
+		entry.mu.RLock()
+	}
+
+	// Step 3: Return a function that releases both
+	// the chunk lock and its registry reference.
+	return func() {
+		if write {
+			entry.mu.Unlock()
+		} else {
+			entry.mu.RUnlock()
+		}
+
+		s.locksMu.Lock()
+		entry.refs--
+
+		if entry.refs == 0 {
+			delete(s.chunkLocks, id)
+		}
+
+		s.locksMu.Unlock()
+	}
 }
 
 func (s *FileStore) List() ([]ChunkInfo, error) {
@@ -72,14 +102,13 @@ func (s *FileStore) List() ([]ChunkInfo, error) {
 			continue
 		}
 
-		chunkMu := s.lockFor(id)
-		chunkMu.RLock()
+		unlock := s.lockChunk(id, false)
 
 		info, err := os.Lstat(
 			filepath.Join(s.rootDir, id),
 		)
 
-		chunkMu.RUnlock()
+		unlock()
 
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -153,11 +182,8 @@ func (s *FileStore) Put(
 	}
 
 	// 5. Synchronize publication with Get, Delete and List.
-	chunkMu := s.lockFor(id)
-
-	chunkMu.Lock()
-	defer chunkMu.Unlock()
-
+	unlock := s.lockChunk(id, true)
+	defer unlock()
 	// Publish without overwriting an existing chunk.
 	finalPath := filepath.Join(s.rootDir, id)
 
@@ -192,10 +218,8 @@ func (s *FileStore) Get(id string) (io.ReadCloser, error) {
 		return nil, ErrInvalidChunk
 	}
 
-	chunkMu := s.lockFor(id)
-
-	chunkMu.RLock()
-	defer chunkMu.RUnlock()
+	unlock := s.lockChunk(id, false)
+	defer unlock()
 
 	path := filepath.Join(s.rootDir, id)
 
@@ -211,10 +235,8 @@ func (s *FileStore) Delete(id string) error {
 	if !validChunkID(id) {
 		return ErrInvalidChunk
 	}
-	chunkMu := s.lockFor(id)
-
-	chunkMu.Lock()
-	defer chunkMu.Unlock()
+	unlock := s.lockChunk(id, true)
+	defer unlock()
 
 	path := filepath.Join(s.rootDir, id)
 

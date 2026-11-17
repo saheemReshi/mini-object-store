@@ -202,3 +202,45 @@ func TestConcurrentPut(t *testing.T) {
 		t.Fatalf("expected 1 chunk, got %d", len(chunks))
 	}
 }
+
+func TestLockLifecycle(t *testing.T) {
+	store, err := NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two readers acquire references to the same lock.
+	release1 := store.lockChunk("chunk-A", false)
+	release2 := store.lockChunk("chunk-A", false)
+
+	store.locksMu.Lock()
+	entry := store.chunkLocks["chunk-A"]
+	refs := entry.refs
+	store.locksMu.Unlock()
+
+	if refs != 2 {
+		t.Fatalf("expected 2 references, got %d", refs)
+	}
+
+	// First reader releases its reference.
+	release1()
+
+	store.locksMu.Lock()
+	refs = store.chunkLocks["chunk-A"].refs
+	store.locksMu.Unlock()
+
+	if refs != 1 {
+		t.Fatalf("expected 1 reference, got %d", refs)
+	}
+
+	// Last reader releases. Entry should disappear.
+	release2()
+
+	store.locksMu.Lock()
+	remaining := len(store.chunkLocks)
+	store.locksMu.Unlock()
+
+	if remaining != 0 {
+		t.Fatalf("expected empty registry, got %d entries", remaining)
+	}
+}
