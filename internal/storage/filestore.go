@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const ChunkSize int64 = 1_000_000
@@ -17,16 +18,89 @@ var (
 	ErrChunkConflict = errors.New("chunk already exists with different contents")
 )
 
+type ChunkInfo struct {
+	ID   string `json:"chunk_id"`
+	Size int64  `json:"size"`
+}
+
 type FileStore struct {
 	rootDir string
+
+	locksMu    sync.Mutex
+	chunkLocks map[string]*sync.RWMutex
 }
 
 func NewFileStore(rootDir string) (*FileStore, error) {
 	if err := os.MkdirAll(rootDir, 0700); err != nil {
-		return nil, fmt.Errorf("create storage directory: %w", err)
+		return nil, fmt.Errorf(
+			"create storage directory: %w", err,
+		)
 	}
 
-	return &FileStore{rootDir: rootDir}, nil
+	return &FileStore{
+		rootDir:    rootDir,
+		chunkLocks: make(map[string]*sync.RWMutex),
+	}, nil
+}
+
+func (s *FileStore) lockFor(id string) *sync.RWMutex {
+	s.locksMu.Lock()
+	defer s.locksMu.Unlock()
+
+	if mu, exists := s.chunkLocks[id]; exists {
+		return mu
+	}
+
+	mu := &sync.RWMutex{}
+	s.chunkLocks[id] = mu
+
+	return mu
+}
+
+func (s *FileStore) List() ([]ChunkInfo, error) {
+	entries, err := os.ReadDir(s.rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("list chunks: %w", err)
+	}
+
+	var chunks []ChunkInfo
+
+	for _, entry := range entries {
+		id := entry.Name()
+
+		if !validChunkID(id) {
+			continue
+		}
+
+		chunkMu := s.lockFor(id)
+		chunkMu.RLock()
+
+		info, err := os.Lstat(
+			filepath.Join(s.rootDir, id),
+		)
+
+		chunkMu.RUnlock()
+
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf(
+				"stat chunk %s: %w", id, err,
+			)
+		}
+
+		if !info.Mode().IsRegular() {
+			continue
+		}
+
+		chunks = append(chunks, ChunkInfo{
+			ID:   id,
+			Size: info.Size(),
+		})
+	}
+
+	return chunks, nil
 }
 
 func (s *FileStore) Put(
@@ -78,13 +152,26 @@ func (s *FileStore) Put(
 		return fmt.Errorf("close chunk: %w", err)
 	}
 
-	// 5. Publish without overwriting an existing chunk.
+	// 5. Synchronize publication with Get, Delete and List.
+	chunkMu := s.lockFor(id)
+
+	chunkMu.Lock()
+	defer chunkMu.Unlock()
+
+	// Publish without overwriting an existing chunk.
 	finalPath := filepath.Join(s.rootDir, id)
 
 	if err := os.Link(tmp.Name(), finalPath); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return verifyExisting(finalPath, expectedSize, expectedHash)
+			if err := verifyExisting(
+				finalPath, expectedSize, expectedHash,
+			); err != nil {
+				return err
+			}
+
+			return syncDirectory(s.rootDir)
 		}
+
 		return fmt.Errorf("publish chunk: %w", err)
 	}
 
@@ -95,6 +182,48 @@ func (s *FileStore) Put(
 
 	if err := syncDirectory(s.rootDir); err != nil {
 		return fmt.Errorf("sync storage directory: %w", err)
+	}
+
+	return nil
+}
+
+func (s *FileStore) Get(id string) (io.ReadCloser, error) {
+	if !validChunkID(id) {
+		return nil, ErrInvalidChunk
+	}
+
+	chunkMu := s.lockFor(id)
+
+	chunkMu.RLock()
+	defer chunkMu.RUnlock()
+
+	path := filepath.Join(s.rootDir, id)
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open chunk %s: %w", id, err)
+	}
+
+	return f, nil
+}
+
+func (s *FileStore) Delete(id string) error {
+	if !validChunkID(id) {
+		return ErrInvalidChunk
+	}
+	chunkMu := s.lockFor(id)
+
+	chunkMu.Lock()
+	defer chunkMu.Unlock()
+
+	path := filepath.Join(s.rootDir, id)
+
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("delete chunk %s: %w", id, err)
+	}
+
+	if err := syncDirectory(s.rootDir); err != nil {
+		return fmt.Errorf("sync after deleting chunk: %w", err)
 	}
 
 	return nil
