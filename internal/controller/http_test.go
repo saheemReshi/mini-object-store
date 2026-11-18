@@ -13,7 +13,7 @@ import (
 
 func TestRegisterAndList(t *testing.T) {
 	reg := NewRegistry()
-	handler := NewHandler(reg)
+	handler := NewHandler(reg, nil)
 
 	send := func(id, address string) int {
 		t.Helper()

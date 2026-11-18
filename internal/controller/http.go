@@ -9,10 +9,18 @@ import (
 
 type Handler struct {
 	registry *Registry
+	objects  *ObjectService
 }
 
-func NewHandler(registry *Registry) http.Handler {
-	h := &Handler{registry: registry}
+func NewHandler(
+	registry *Registry,
+	objects *ObjectService,
+) http.Handler {
+	h := &Handler{
+		registry: registry,
+		objects:  objects,
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc(
@@ -29,6 +37,13 @@ func NewHandler(registry *Registry) http.Handler {
 		"POST /internal/workers/heartbeat",
 		h.heartbeatWorker,
 	)
+
+	if objects != nil {
+		mux.HandleFunc(
+			"POST /api/v1/objects",
+			h.uploadObject,
+		)
+	}
 
 	return mux
 }

@@ -13,7 +13,7 @@ func TestWorkerRegistration(t *testing.T) {
 	registry := controller.NewRegistry()
 
 	server := httptest.NewServer(
-		controller.NewHandler(registry),
+		controller.NewHandler(registry,nil),
 	)
 	defer server.Close()
 
@@ -41,7 +41,7 @@ func TestHeartbeatClient(t *testing.T) {
 	registry := controller.NewRegistry()
 
 	server := httptest.NewServer(
-		controller.NewHandler(registry),
+		controller.NewHandler(registry,nil),
 	)
 	defer server.Close()
 

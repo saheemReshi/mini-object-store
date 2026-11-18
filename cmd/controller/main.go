@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"mini-object-store/internal/controller"
+	"mini-object-store/internal/metadata"
 )
 
 func main() {
@@ -16,10 +17,19 @@ func main() {
 	}
 
 	registry := controller.NewRegistry()
+	metaStore := metadata.NewMemoryStore()
+
+	workerClient := controller.NewWorkerClient()
+
+	objectService := controller.NewObjectService(
+		registry,
+		metaStore,
+		workerClient,
+	)
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           controller.NewHandler(registry),
+		Handler:           controller.NewHandler(registry, objectService),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
