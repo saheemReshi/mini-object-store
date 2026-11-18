@@ -21,6 +21,11 @@ func main() {
 		addr = ":8081"
 	}
 
+	workerID := os.Getenv("WORKER_ID")
+	if workerID == "" {
+		workerID = "worker1"
+	}
+
 	store, err := storage.NewFileStore(dataDir)
 	if err != nil {
 		log.Fatal(err)
@@ -28,7 +33,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           worker.NewHandler(store),
+		Handler:           worker.NewHandler(store, workerID),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

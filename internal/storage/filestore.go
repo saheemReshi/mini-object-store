@@ -93,7 +93,7 @@ func (s *FileStore) List() ([]ChunkInfo, error) {
 		return nil, fmt.Errorf("list chunks: %w", err)
 	}
 
-	var chunks []ChunkInfo
+	chunks := make([]ChunkInfo, 0)
 
 	for _, entry := range entries {
 		id := entry.Name()

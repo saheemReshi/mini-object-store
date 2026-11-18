@@ -13,11 +13,18 @@ import (
 )
 
 type Handler struct {
-	store *storage.FileStore
+	store    *storage.FileStore
+	workerID string
 }
 
-func NewHandler(store *storage.FileStore) http.Handler {
-	h := &Handler{store: store}
+func NewHandler(
+	store *storage.FileStore,
+	workerID string,
+) http.Handler {
+	h := &Handler{
+		store:    store,
+		workerID: workerID,
+	}
 
 	mux := http.NewServeMux()
 
@@ -29,6 +36,16 @@ func NewHandler(store *storage.FileStore) http.Handler {
 	mux.HandleFunc(
 		"GET /internal/chunks/{chunk_id}",
 		h.getChunk,
+	)
+
+	mux.HandleFunc(
+		"DELETE /internal/chunks/{chunk_id}",
+		h.deleteChunk,
+	)
+
+	mux.HandleFunc(
+		"GET /internal/workers/{worker_id}/chunks",
+		h.listChunks,
 	)
 
 	return mux
@@ -105,6 +122,86 @@ func (h *Handler) getChunk(w http.ResponseWriter, r *http.Request) {
 
 	if _, err := io.Copy(w, reader); err != nil {
 		log.Printf("stream chunk %s: %v", id, err)
+	}
+}
+
+func (h *Handler) deleteChunk(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	id := r.PathValue("chunk_id")
+
+	err := h.store.Delete(id)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrInvalidChunk):
+			writeError(
+				w,
+				http.StatusBadRequest,
+				"invalid chunk ID",
+			)
+
+		case errors.Is(err, os.ErrNotExist):
+			writeError(
+				w,
+				http.StatusNotFound,
+				"chunk not found",
+			)
+
+		default:
+			log.Printf("DELETE chunk %s: %v", id, err)
+			writeError(
+				w,
+				http.StatusInternalServerError,
+				"storage failure",
+			)
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) listChunks(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	requestedID := r.PathValue("worker_id")
+
+	// Ensure this request targets the correct worker.
+	if requestedID != h.workerID {
+		writeError(
+			w,
+			http.StatusNotFound,
+			"worker not found",
+		)
+		return
+	}
+
+	chunks, err := h.store.List()
+	if err != nil {
+		log.Printf("list chunks: %v", err)
+
+		writeError(
+			w,
+			http.StatusInternalServerError,
+			"failed to list chunks",
+		)
+		return
+	}
+
+	response := struct {
+		WorkerID string              `json:"worker_id"`
+		Chunks   []storage.ChunkInfo `json:"chunks"`
+	}{
+		WorkerID: h.workerID,
+		Chunks:   chunks,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("encode inventory: %v", err)
 	}
 }
 
