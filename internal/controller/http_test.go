@@ -1,0 +1,93 @@
+package controller
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+)
+
+func TestRegisterAndList(t *testing.T) {
+	reg := NewRegistry()
+	handler := NewHandler(reg)
+
+	send := func(id, address string) int {
+		t.Helper()
+
+		data, _ := json.Marshal(map[string]string{
+			"worker_id": id,
+			"address":   address,
+		})
+
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/internal/workers/register",
+			bytes.NewReader(data),
+		)
+
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		return resp.Code
+	}
+
+	if got := send("worker1", "http://localhost:8081"); got != 201 {
+		t.Fatalf("new registration: %d", got)
+	}
+
+	if got := send("worker1", "http://localhost:8081"); got != 200 {
+		t.Fatalf("duplicate registration: %d", got)
+	}
+
+	if got := send("worker1", "http://localhost:8082"); got != 409 {
+		t.Fatalf("conflicting registration: %d", got)
+	}
+
+	if got := send("../../x", "http://localhost:8083"); got != 400 {
+		t.Fatalf("invalid registration: %d", got)
+	}
+
+	if len(reg.List()) != 1 {
+		t.Fatal("expected exactly one registered worker")
+	}
+}
+
+func TestConcurrentRegistration(t *testing.T) {
+	reg := NewRegistry()
+
+	var wg sync.WaitGroup
+	results := make(chan bool, 40)
+
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			_, created, err := reg.Register(
+				"worker1",
+				"http://localhost:8081",
+			)
+			if err != nil {
+				t.Errorf("registration: %v", err)
+			}
+
+			results <- created
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	createdCount := 0
+	for created := range results {
+		if created {
+			createdCount++
+		}
+	}
+
+	if createdCount != 1 || len(reg.List()) != 1 {
+		t.Fatalf("created %d workers, want 1", createdCount)
+	}
+}
