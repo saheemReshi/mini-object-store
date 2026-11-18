@@ -3,10 +3,12 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRegisterAndList(t *testing.T) {
@@ -89,5 +91,58 @@ func TestConcurrentRegistration(t *testing.T) {
 
 	if createdCount != 1 || len(reg.List()) != 1 {
 		t.Fatalf("created %d workers, want 1", createdCount)
+	}
+}
+
+func TestWorkerHealth(t *testing.T) {
+	registry := NewRegistry()
+
+	// Register worker.
+	_, _, err := registry.Register(
+		"worker1",
+		"http://localhost:8081",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := registry.List()[0].Status; got != "registered" {
+		t.Fatalf("expected registered, got %s", got)
+	}
+
+	// First heartbeat makes it healthy.
+	if err := registry.Heartbeat("worker1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := registry.List()[0].Status; got != "healthy" {
+		t.Fatalf("expected healthy, got %s", got)
+	}
+
+	// Simulate a worker that hasn't contacted us recently.
+	registry.mu.Lock()
+	w := registry.workers["worker1"]
+	w.LastContact = time.Now().Add(
+		-WorkerFailureTimeout - time.Second,
+	)
+	registry.workers["worker1"] = w
+	registry.mu.Unlock()
+
+	if got := registry.List()[0].Status; got != "unavailable" {
+		t.Fatalf("expected unavailable, got %s", got)
+	}
+
+	// A fresh heartbeat restores healthy status.
+	if err := registry.Heartbeat("worker1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := registry.List()[0].Status; got != "healthy" {
+		t.Fatalf("expected healthy, got %s", got)
+	}
+
+	// Unknown workers cannot send heartbeats.
+	if err := registry.Heartbeat("unknown"); !errors.Is(err, ErrWorkerNotFound) {
+		t.Fatalf("expected ErrWorkerNotFound, got %v", err)
 	}
 }

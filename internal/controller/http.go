@@ -25,8 +25,54 @@ func NewHandler(registry *Registry) http.Handler {
 		"GET /internal/workers",
 		h.listWorkers,
 	)
+	mux.HandleFunc(
+		"POST /internal/workers/heartbeat",
+		h.heartbeatWorker,
+	)
 
 	return mux
+}
+
+func (h *Handler) heartbeatWorker(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	defer r.Body.Close()
+
+	var req struct {
+		WorkerID string `json:"worker_id"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid heartbeat JSON")
+		return
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "expected one JSON object")
+		return
+	}
+
+	err := h.registry.Heartbeat(req.WorkerID)
+
+	switch {
+	case errors.Is(err, ErrInvalidWorker):
+		writeError(w, http.StatusBadRequest, err.Error())
+
+	case errors.Is(err, ErrWorkerNotFound):
+		writeError(w, http.StatusNotFound, "worker not registered")
+
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "heartbeat failed")
+
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func (h *Handler) registerWorker(

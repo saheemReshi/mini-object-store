@@ -11,12 +11,18 @@ import (
 var (
 	ErrInvalidWorker  = errors.New("invalid worker registration")
 	ErrWorkerConflict = errors.New("worker ID already registered with a different address")
+	ErrWorkerNotFound = errors.New("worker not registered")
 )
 
+const WorkerFailureTimeout = 6 * time.Second
+
 type Worker struct {
-	ID           string    `json:"worker_id"`
-	Address      string    `json:"address"`
-	RegisteredAt time.Time `json:"registered_at"`
+	ID            string     `json:"worker_id"`
+	Address       string     `json:"address"`
+	RegisteredAt  time.Time  `json:"registered_at"`
+	LastContact   time.Time  `json:"last_contact"`
+	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+	Status        string     `json:"status"`
 }
 
 type Registry struct {
@@ -42,30 +48,53 @@ func (r *Registry) Register(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	now := time.Now().UTC()
+
 	if existing, ok := r.workers[id]; ok {
 		if existing.Address != address {
 			return Worker{}, false, ErrWorkerConflict
 		}
+
+		// An existing worker may have restarted.
+		existing.LastContact = now
+		existing.LastHeartbeat = nil
+		existing.Status = "registered"
+
+		r.workers[id] = existing
 		return existing, false, nil
 	}
 
 	worker := Worker{
 		ID:           id,
 		Address:      address,
-		RegisteredAt: time.Now().UTC(),
+		RegisteredAt: now,
+		LastContact:  now,
+		Status:       "registered",
 	}
 
 	r.workers[id] = worker
 	return worker, true, nil
+
 }
 
 func (r *Registry) List() []Worker {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	now := time.Now()
+
 	result := make([]Worker, 0, len(r.workers))
 
 	for _, worker := range r.workers {
+		// Derive health from the last contact time.
+		if now.Sub(worker.LastContact) > WorkerFailureTimeout {
+			worker.Status = "unavailable"
+		} else if worker.LastHeartbeat == nil {
+			worker.Status = "registered"
+		} else {
+			worker.Status = "healthy"
+		}
+
 		result = append(result, worker)
 	}
 
@@ -74,6 +103,29 @@ func (r *Registry) List() []Worker {
 	})
 
 	return result
+}
+
+func (r *Registry) Heartbeat(id string) error {
+	if !validWorkerID(id) {
+		return ErrInvalidWorker
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	worker, exists := r.workers[id]
+	if !exists {
+		return ErrWorkerNotFound
+	}
+
+	now := time.Now().UTC()
+
+	worker.LastContact = now
+	worker.LastHeartbeat = &now
+	worker.Status = "healthy"
+
+	r.workers[id] = worker
+	return nil
 }
 
 func validWorkerID(id string) bool {

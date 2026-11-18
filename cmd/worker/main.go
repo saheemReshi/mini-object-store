@@ -48,36 +48,15 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	// Registration runs independently of the HTTP server.
-	go func() {
-		client := &http.Client{
-			Timeout: 3 * time.Second,
-		}
+	client := &http.Client{}
 
-		for {
-			ctx, cancel := context.WithTimeout(
-				context.Background(),
-				3*time.Second,
-			)
-
-			err := worker.Register(
-				ctx,
-				client,
-				controllerURL,
-				workerID,
-				advertiseURL,
-			)
-			cancel()
-
-			if err == nil {
-				log.Printf("worker %s registered", workerID)
-				return
-			}
-
-			log.Printf("registration failed: %v; retrying", err)
-			time.Sleep(2 * time.Second)
-		}
-	}()
+	go worker.RunMembership(
+		context.Background(),
+		client,
+		controllerURL,
+		workerID,
+		advertiseURL,
+	)
 
 	log.Printf("worker %s listening on %s", workerID, addr)
 	log.Fatal(server.ListenAndServe())
