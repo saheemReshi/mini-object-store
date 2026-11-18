@@ -43,6 +43,26 @@ func NewHandler(
 			"POST /api/v1/objects",
 			h.uploadObject,
 		)
+		mux.HandleFunc(
+			"GET /api/v1/objects/{object_id}",
+			h.downloadObject,
+		)
+		mux.HandleFunc(
+			"GET /api/v1/objects/{object_id}/metadata",
+			h.getObjectMetadata,
+		)
+		mux.HandleFunc(
+			"PATCH /api/v1/objects/{object_id}/metadata",
+			h.patchObjectMetadata,
+		)
+		mux.HandleFunc(
+			"DELETE /api/v1/objects/{object_id}",
+			h.deleteObject,
+		)
+		mux.HandleFunc(
+			"GET /api/v1/objects",
+			h.listObjects,
+		)
 	}
 
 	return mux

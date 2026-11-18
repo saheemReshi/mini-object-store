@@ -24,6 +24,7 @@ type ObjectService struct {
 	registry *Registry
 	store    metadata.Store
 	client   *WorkerClient
+	locks    *objectLockTable
 }
 
 func NewObjectService(
@@ -35,6 +36,7 @@ func NewObjectService(
 		registry: registry,
 		store:    store,
 		client:   client,
+		locks:    newObjectLockTable(),
 	}
 }
 

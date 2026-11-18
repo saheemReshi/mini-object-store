@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 )
@@ -36,8 +37,15 @@ type Object struct {
 type Store interface {
 	CreateObject(ctx context.Context, obj Object) error
 	GetObject(ctx context.Context, id string) (Object, error)
-}
 
+	ListObjects(ctx context.Context) ([]Object, error)
+	PatchCustomMetadata(
+		ctx context.Context,
+		id string,
+		patch map[string]string,
+	) (Object, error)
+	DeleteObject(ctx context.Context, id string) error
+}
 type MemoryStore struct {
 	mu      sync.RWMutex
 	objects map[string]Object
@@ -105,4 +113,78 @@ func (m *MemoryStore) GetObject(
 	}
 
 	return cloneObject(obj), nil
+}
+
+func (m *MemoryStore) ListObjects(
+	ctx context.Context,
+) ([]Object, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make([]Object, 0, len(m.objects))
+	for _, obj := range m.objects {
+		result = append(result, cloneObject(obj))
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID < result[j].ID
+	})
+
+	return result, nil
+}
+
+func (m *MemoryStore) PatchCustomMetadata(
+	ctx context.Context,
+	id string,
+	patch map[string]string,
+) (Object, error) {
+	if err := ctx.Err(); err != nil {
+		return Object{}, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	obj, exists := m.objects[id]
+	if !exists {
+		return Object{}, ErrObjectNotFound
+	}
+
+	obj = cloneObject(obj)
+
+	if obj.CustomMetadata == nil {
+		obj.CustomMetadata = make(map[string]string)
+	}
+
+	for key, value := range patch {
+		obj.CustomMetadata[key] = value
+	}
+
+	obj.ModifiedAt = time.Now().UTC()
+	m.objects[id] = obj
+
+	return cloneObject(obj), nil
+}
+
+func (m *MemoryStore) DeleteObject(
+	ctx context.Context,
+	id string,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.objects[id]; !exists {
+		return ErrObjectNotFound
+	}
+
+	delete(m.objects, id)
+	return nil
 }
