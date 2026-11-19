@@ -55,6 +55,16 @@ type nopCloser struct{}
 
 func (nopCloser) Close() error { return nil }
 
+func shutdownServer(ctx context.Context, server *http.Server) error {
+	if err := server.Shutdown(ctx); err != nil {
+		// Shutdown stops waiting when ctx expires but leaves active connections
+		// open. Close them to cancel request contexts and release object locks
+		// before run waits for a repair goroutine blocked behind those requests.
+		return errors.Join(err, server.Close())
+	}
+	return nil
+}
+
 func run() error {
 	addr := os.Getenv("CONTROLLER_ADDR")
 	if addr == "" {
@@ -113,7 +123,7 @@ func run() error {
 	case <-ctx.Done():
 		log.Printf("controller shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		err = server.Shutdown(shutdownCtx)
+		err = shutdownServer(shutdownCtx, server)
 		cancel()
 	}
 	stop() // Also stops repair if the listener failed.

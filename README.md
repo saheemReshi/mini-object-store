@@ -81,6 +81,15 @@ falls back to in-memory metadata. Stop the controller with Ctrl+C (or SIGTERM) t
 close the database cleanly; SQLite's write-ahead log also makes an abrupt kill
 safe for committed metadata.
 
+Database paths are literal filenames: spaces and reserved characters such as
+`?`, `#`, and `%` do not become SQLite connection parameters. Quote paths with
+spaces when setting `METADATA_DB_PATH` in a shell.
+
+On shutdown, the controller gives active HTTP requests up to 20 seconds to finish.
+If that deadline expires, it closes active connections to cancel their requests
+before waiting for repair to stop. This lets downloads release object locks that
+repair may be waiting for; interrupted requests may need to be retried.
+
 Open four more terminals. In each one, run the following with `i` set to a
 different value: **1, 2, 3, or 4**.
 

@@ -192,3 +192,60 @@ func TestSQLiteSeparateFilesAreIndependent(t *testing.T) {
 		t.Fatalf("databases share state: %v", err)
 	}
 }
+
+func TestSQLiteLiteralFilenames(t *testing.T) {
+	for _, relative := range []bool{false, true} {
+		mode := "absolute"
+		if relative {
+			mode = "relative"
+		}
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			if relative {
+				t.Chdir(dir)
+				dir = "."
+			}
+			filenames := []string{
+				"metadata?first.db",
+				"metadata?second.db",
+				"metadata#fragment.db",
+				"metadata%3Fencoded.db",
+				"metadata with spaces.db",
+				"file:metadata.db",
+			}
+			for i, filename := range filenames {
+				t.Run(filename, func(t *testing.T) {
+					// Reserved characters in directories must be literal too.
+					path := filepath.Join(dir, "directory ?#% with spaces", filename)
+					s := openTestSQLite(t, path)
+					t.Cleanup(func() { s.Close() })
+					if s.Path() != path {
+						t.Fatalf("Path changed: got %q, want %q", s.Path(), path)
+					}
+					ctx := context.Background()
+					obj := sampleObject(filename, 1)
+					if err := s.CreateObject(ctx, obj); err != nil {
+						t.Fatal(err)
+					}
+					for _, previous := range filenames[:i] {
+						if _, err := s.GetObject(ctx, previous); !errors.Is(err, ErrObjectNotFound) {
+							t.Fatalf("database aliases %q: %v", previous, err)
+						}
+					}
+					if err := s.Close(); err != nil {
+						t.Fatal(err)
+					}
+					info, err := os.Stat(path)
+					if err != nil || !info.Mode().IsRegular() {
+						t.Fatalf("requested database file was not created: %v", err)
+					}
+					reopened := openTestSQLite(t, path)
+					defer reopened.Close()
+					if got := mustGet(t, reopened, obj.ID); !reflect.DeepEqual(got, obj) {
+						t.Fatal("object did not survive reopening the literal filename")
+					}
+				})
+			}
+		})
+	}
+}

@@ -50,10 +50,12 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 	if path == "" {
 		return nil, errors.New("sqlite: empty database path")
 	}
-	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return nil, fmt.Errorf("sqlite: create database directory %q: %w", dir, err)
-		}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: resolve database path %q: %w", path, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(absPath), 0o750); err != nil {
+		return nil, fmt.Errorf("sqlite: create database directory %q: %w", filepath.Dir(absPath), err)
 	}
 
 	pragmas := url.Values{}
@@ -66,7 +68,14 @@ func OpenSQLiteStore(path string) (*SQLiteStore, error) {
 		pragmas.Add("_pragma", p)
 	}
 
-	db, err := sql.Open(sqliteDriverName, path+"?"+pragmas.Encode())
+	// Escape the filename separately from driver parameters. A raw '?' would
+	// otherwise truncate the filename and could alias a different database.
+	dsn := url.URL{
+		Scheme:   "file",
+		Path:     filepath.ToSlash(absPath),
+		RawQuery: pragmas.Encode(),
+	}
+	db, err := sql.Open(sqliteDriverName, dsn.String())
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open %q: %w", path, err)
 	}
