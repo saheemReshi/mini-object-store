@@ -84,6 +84,9 @@ func (s *ObjectService) Download(
 	if err != nil {
 		return nil, metadata.Object{}, err
 	}
+	if obj.Deleting {
+		return nil, metadata.Object{}, metadata.ErrObjectDeleting
+	}
 
 	tmp, err := os.CreateTemp("", "object-download-*")
 	if err != nil {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -25,6 +26,11 @@ func main() {
 		registry,
 		metaStore,
 		workerClient,
+	)
+	// Background replication and integrity repair.
+	go objectService.RunRepair(
+		context.Background(),
+		15*time.Second,
 	)
 
 	server := &http.Server{

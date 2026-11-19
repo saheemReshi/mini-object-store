@@ -30,6 +30,10 @@ func (h *Handler) downloadObject(
 			writeError(w, http.StatusServiceUnavailable,
 				"object data unavailable or corrupt")
 
+		case errors.Is(err, metadata.ErrObjectDeleting):
+			writeError(w, http.StatusServiceUnavailable,
+				"object deletion in progress")
+
 		default:
 			log.Printf("download %s: %v", id, err)
 			writeError(w, http.StatusInternalServerError,
@@ -180,6 +184,9 @@ func (h *Handler) deleteObject(
 func handleMetadataError(w http.ResponseWriter, err error) {
 	if errors.Is(err, metadata.ErrObjectNotFound) {
 		writeError(w, http.StatusNotFound, "object not found")
+	} else if errors.Is(err, metadata.ErrObjectDeleting) {
+		writeError(w, http.StatusServiceUnavailable,
+			"object deletion in progress")
 	} else {
 		log.Printf("metadata: %v", err)
 		writeError(w, http.StatusInternalServerError,

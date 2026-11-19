@@ -3,14 +3,18 @@ package metadata
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"sync"
 	"time"
 )
 
 var (
-	ErrObjectExists   = errors.New("object already exists")
-	ErrObjectNotFound = errors.New("object not found")
+	ErrObjectExists    = errors.New("object already exists")
+	ErrObjectNotFound  = errors.New("object not found")
+	ErrObjectDeleting  = errors.New("object deletion in progress")
+	ErrReplicaConflict = errors.New("replica locations changed")
+	ErrChunkNotFound   = errors.New("chunk not found in metadata")
 )
 
 type Chunk struct {
@@ -32,6 +36,7 @@ type Object struct {
 	ChunkCount     int               `json:"chunk_count"`
 	Chunks         []Chunk           `json:"chunks"`
 	CustomMetadata map[string]string `json:"custom_metadata"`
+	Deleting       bool              `json:"-"`
 }
 
 type Store interface {
@@ -45,6 +50,18 @@ type Store interface {
 		patch map[string]string,
 	) (Object, error)
 	DeleteObject(ctx context.Context, id string) error
+	MarkDeleting(
+		ctx context.Context,
+		objectID string,
+	) error
+
+	UpdateChunkReplicas(
+		ctx context.Context,
+		objectID string,
+		chunkID string,
+		expected []string,
+		replacement []string,
+	) error
 }
 type MemoryStore struct {
 	mu      sync.RWMutex
@@ -127,6 +144,10 @@ func (m *MemoryStore) ListObjects(
 
 	result := make([]Object, 0, len(m.objects))
 	for _, obj := range m.objects {
+		if obj.Deleting {
+			continue
+		}
+
 		result = append(result, cloneObject(obj))
 	}
 
@@ -152,6 +173,9 @@ func (m *MemoryStore) PatchCustomMetadata(
 	obj, exists := m.objects[id]
 	if !exists {
 		return Object{}, ErrObjectNotFound
+	}
+	if obj.Deleting {
+		return Object{}, ErrObjectDeleting
 	}
 
 	obj = cloneObject(obj)
@@ -187,4 +211,78 @@ func (m *MemoryStore) DeleteObject(
 
 	delete(m.objects, id)
 	return nil
+}
+
+func (m *MemoryStore) MarkDeleting(
+	ctx context.Context,
+	id string,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	obj, exists := m.objects[id]
+	if !exists {
+		return ErrObjectNotFound
+	}
+
+	obj.Deleting = true
+	m.objects[id] = obj
+	return nil
+}
+
+func (m *MemoryStore) UpdateChunkReplicas(
+	ctx context.Context,
+	objectID string,
+	chunkID string,
+	expected []string,
+	replacement []string,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if len(replacement) != 2 ||
+		replacement[0] == replacement[1] {
+		return ErrReplicaConflict
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	obj, exists := m.objects[objectID]
+	if !exists {
+		return ErrObjectNotFound
+	}
+
+	if obj.Deleting {
+		return ErrObjectDeleting
+	}
+
+	obj = cloneObject(obj)
+
+	for i := range obj.Chunks {
+		chunk := &obj.Chunks[i]
+
+		if chunk.ID != chunkID {
+			continue
+		}
+
+		// Reject stale replica-location updates.
+		if !slices.Equal(chunk.Replicas, expected) {
+			return ErrReplicaConflict
+		}
+
+		chunk.Replicas = append(
+			[]string(nil), replacement...,
+		)
+
+		m.objects[objectID] = obj
+		return nil
+	}
+
+	return ErrChunkNotFound
 }
