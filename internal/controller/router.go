@@ -64,5 +64,12 @@ func NewHandler(
 		)
 	}
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := mux.Handler(r); pattern == "" {
+			// Only wrap unmatched requests; application handlers and binary
+			// downloads keep their original ResponseWriter.
+			w = &routeErrorWriter{ResponseWriter: w}
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
