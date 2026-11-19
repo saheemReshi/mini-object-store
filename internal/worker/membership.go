@@ -14,6 +14,9 @@ const (
 	requestTimeout    = 3 * time.Second
 )
 
+// RunMembership registers, sends heartbeats, and retries until ctx is canceled.
+// A controller restart loses its registry; an unknown-worker heartbeat response
+// sends this loop back through registration without restarting the worker.
 func RunMembership(
 	ctx context.Context,
 	client *http.Client,
@@ -36,6 +39,8 @@ func RunMembership(
 			workerID,
 			advertiseURL,
 		)
+		// Release each request's timer now rather than deferring it for the
+		// lifetime of this long-running membership goroutine.
 		cancel()
 
 		if err != nil {

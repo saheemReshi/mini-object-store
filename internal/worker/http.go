@@ -17,6 +17,8 @@ type Handler struct {
 	workerID string
 }
 
+// NewHandler exposes internal chunk and inventory routes. FileStore enforces
+// size/hash validation before a PUT is acknowledged as successfully stored.
 func NewHandler(
 	store *storage.FileStore,
 	workerID string,
@@ -72,7 +74,8 @@ func (h *Handler) putChunk(w http.ResponseWriter, r *http.Request) {
 	var expectedHash [32]byte
 	copy(expectedHash[:], decoded)
 
-	// HTTP request body is an io.Reader.
+	// Carry cancellation into staging so a disconnected uploader can stop before
+	// publication. The controller still cleans up uncertain completed writes.
 	err = h.store.PutContext(
 		r.Context(),
 		id,

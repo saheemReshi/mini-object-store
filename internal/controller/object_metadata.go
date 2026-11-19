@@ -6,6 +6,7 @@ import (
 	"mini-object-store/internal/metadata"
 )
 
+// GetMetadata returns a detached snapshot of an object that is not being deleted.
 func (s *ObjectService) GetMetadata(
 	ctx context.Context,
 	id string,
@@ -25,12 +26,14 @@ func (s *ObjectService) GetMetadata(
 	return obj, nil
 }
 
+// ListObjects excludes deletion tombstones through the Store contract.
 func (s *ObjectService) ListObjects(
 	ctx context.Context,
 ) ([]metadata.Object, error) {
 	return s.store.ListObjects(ctx)
 }
 
+// PatchMetadata merges custom key/value pairs without changing stored object data.
 func (s *ObjectService) PatchMetadata(
 	ctx context.Context,
 	id string,

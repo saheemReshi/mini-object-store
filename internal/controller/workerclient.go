@@ -25,10 +25,14 @@ var (
 	ErrChunkCorrupt  = errors.New("chunk integrity failure")
 )
 
+// WorkerClient owns controller-to-worker HTTP behavior and integrity checks.
+// Each RPC has its own deadline within the caller's overall request context.
 type WorkerClient struct {
 	http *http.Client
 }
 
+// NewWorkerClient rejects redirects so a registered replica cannot silently move
+// its write to an endpoint that the placement metadata does not describe.
 func NewWorkerClient() *WorkerClient {
 	return &WorkerClient{
 		http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -192,6 +196,8 @@ type WorkerInventory struct {
 	Chunks   []storage.ChunkInfo `json:"chunks"`
 }
 
+// ListChunks retrieves inventory only; listed sizes do not prove data integrity.
+// Repair must fetch and hash chunk contents before treating a replica as valid.
 func (c *WorkerClient) ListChunks(
 	ctx context.Context,
 	address, workerID string,

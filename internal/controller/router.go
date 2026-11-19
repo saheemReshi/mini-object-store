@@ -9,6 +9,8 @@ type Handler struct {
 	objects  *ObjectService
 }
 
+// NewHandler wires membership routes and, when objects is non-nil, client object
+// routes. A nil service supports membership-only tests without storage dependencies.
 func NewHandler(
 	registry *Registry,
 	objects *ObjectService,

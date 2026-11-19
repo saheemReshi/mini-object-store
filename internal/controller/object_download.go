@@ -79,6 +79,8 @@ func (s *ObjectService) fetchChunk(
 
 // Download reconstructs the object into a verified temporary file.
 // The caller owns the returned file and must close and remove it.
+// The object read lock covers reconstruction; the independent temporary snapshot
+// remains readable if DELETE runs after this method returns.
 func (s *ObjectService) Download(
 	ctx context.Context,
 	id string,
@@ -139,6 +141,8 @@ func (s *ObjectService) Download(
 		totalSize += int64(len(data))
 	}
 
+	// Per-chunk checks cannot detect every metadata error, such as duplicated
+	// chunks. Verify the reconstructed size and whole-object digest as well.
 	if totalSize != obj.Size ||
 		hex.EncodeToString(objectHash.Sum(nil)) != obj.Checksum {
 		return nil, metadata.Object{}, ErrObjectCorrupt

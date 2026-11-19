@@ -14,6 +14,7 @@ var (
 	ErrWorkerNotFound = errors.New("worker not registered")
 )
 
+// WorkerFailureTimeout is the maximum contact age before List reports unavailable.
 const WorkerFailureTimeout = 6 * time.Second
 
 type Worker struct {
@@ -25,6 +26,8 @@ type Worker struct {
 	Status        string     `json:"status"`
 }
 
+// Registry tracks in-memory membership. Health reflects recent heartbeats, not a
+// disk-integrity check or a guarantee that the next worker RPC will succeed.
 type Registry struct {
 	mu      sync.RWMutex
 	workers map[string]Worker
@@ -90,6 +93,9 @@ func cloneWorker(w Worker) Worker {
 	return w
 }
 
+// List returns sorted, detached snapshots with health computed at read time.
+// Failed workers remain registered so returning workers and stale replicas can
+// still be addressed by their original IDs.
 func (r *Registry) List() []Worker {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

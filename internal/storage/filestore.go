@@ -13,6 +13,7 @@ import (
 	"syscall"
 )
 
+// ChunkSize is a decimal megabyte; the final object chunk may be smaller.
 const ChunkSize int64 = 1_000_000
 
 var (
@@ -29,6 +30,8 @@ type chunkLock struct {
 	refs int
 }
 
+// FileStore keeps immutable chunk files in one trusted directory. One worker
+// process must own each directory: these mutexes do not coordinate other processes.
 type FileStore struct {
 	rootDir string
 
@@ -50,7 +53,8 @@ func NewFileStore(rootDir string) (*FileStore, error) {
 }
 
 func (s *FileStore) lockChunk(id string, write bool) func() {
-	// Step 1: Obtain a reference to the chunk lock.
+	// Register both holders and waiters before acquiring the chunk mutex. This
+	// keeps one shared lock alive until every operation using it has finished.
 	s.locksMu.Lock()
 
 	entry, exists := s.chunkLocks[id]
@@ -62,14 +66,14 @@ func (s *FileStore) lockChunk(id string, write bool) func() {
 	entry.refs++
 	s.locksMu.Unlock()
 
-	// Step 2: Acquire the actual chunk lock.
+	// Do not wait with locksMu held: current holders need it to release refs.
 	if write {
 		entry.mu.Lock()
 	} else {
 		entry.mu.RLock()
 	}
 
-	// Step 3: Return a function that releases both
+	// Return a function that releases both
 	// the chunk lock and its registry reference.
 	return func() {
 		if write {
@@ -89,6 +93,8 @@ func (s *FileStore) lockChunk(id string, write bool) func() {
 	}
 }
 
+// List reports regular, published chunk files. Concurrent deletion can remove an
+// entry during the scan, so this is an inventory view rather than an atomic snapshot.
 func (s *FileStore) List() ([]ChunkInfo, error) {
 	entries, err := os.ReadDir(s.rootDir)
 	if err != nil {
@@ -134,6 +140,8 @@ func (s *FileStore) List() ([]ChunkInfo, error) {
 	return chunks, nil
 }
 
+// Put stores a verified immutable chunk without a cancellation deadline. Identical
+// retries succeed; reusing an ID for different bytes returns ErrChunkConflict.
 func (s *FileStore) Put(
 	id string,
 	src io.Reader,
@@ -156,7 +164,8 @@ func (s *FileStore) PutContext(ctx context.Context, id string, src io.Reader, ex
 		return err
 	}
 
-	// 1. Create a temporary file inside the storage directory.
+	// Stage on the same filesystem as the final name so hard-link publication
+	// is atomic; readers never open a partially written chunk.
 	tmp, err := os.CreateTemp(s.rootDir, ".tmp-chunk-*")
 	if err != nil {
 		return fmt.Errorf("create temporary chunk: %w", err)
@@ -164,9 +173,11 @@ func (s *FileStore) PutContext(ctx context.Context, id string, src io.Reader, ex
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
 
-	// 2. Stream incoming bytes to disk and compute their hash.
+	// Stream incoming bytes to disk and compute their hash.
 	hasher := sha256.New()
 
+	// Read one extra byte to distinguish an exact-size body from an oversized
+	// one without trusting Content-Length or consuming an unbounded reader.
 	n, err := io.Copy(
 		io.MultiWriter(tmp, hasher),
 		io.LimitReader(src, expectedSize+1),
@@ -175,7 +186,7 @@ func (s *FileStore) PutContext(ctx context.Context, id string, src io.Reader, ex
 		return fmt.Errorf("write chunk: %w", err)
 	}
 
-	// 3. Verify length and checksum.
+	// Verify length and checksum before the temporary file becomes visible.
 	if n != expectedSize {
 		return fmt.Errorf(
 			"%w: expected %d bytes, got %d",
@@ -187,7 +198,8 @@ func (s *FileStore) PutContext(ctx context.Context, id string, src io.Reader, ex
 		return fmt.Errorf("%w: checksum mismatch", ErrInvalidChunk)
 	}
 
-	// 4. Flush data and close the temporary file.
+	// Persist contents before publishing their name. The later directory sync
+	// persists the name itself; syncing file data alone is not sufficient.
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("sync chunk: %w", err)
 	}
@@ -195,7 +207,8 @@ func (s *FileStore) PutContext(ctx context.Context, id string, src io.Reader, ex
 		return fmt.Errorf("close chunk: %w", err)
 	}
 
-	// 5. Synchronize publication with Get, Delete and List.
+	// Honor cancellation immediately before publication while still holding
+	// the chunk write lock acquired before staging.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -216,7 +229,7 @@ func (s *FileStore) PutContext(ctx context.Context, id string, src io.Reader, ex
 		return fmt.Errorf("publish chunk: %w", err)
 	}
 
-	// 6. Remove temporary name and persist directory changes.
+	// Remove the temporary name and persist directory changes.
 	if err := os.Remove(tmp.Name()); err != nil {
 		return fmt.Errorf("remove temporary chunk name: %w", err)
 	}
@@ -228,6 +241,10 @@ func (s *FileStore) PutContext(ctx context.Context, id string, src io.Reader, ex
 	return nil
 }
 
+// Get opens a published chunk; the caller must close the returned descriptor.
+// On Linux, unlink removes a filename but an already-open descriptor retains its
+// inode. Immutable contents therefore remain readable after the lock is released
+// even if Delete removes the name or another Put publishes a new inode for it.
 func (s *FileStore) Get(id string) (io.ReadCloser, error) {
 	if !validChunkID(id) {
 		return nil, ErrInvalidChunk
@@ -246,6 +263,9 @@ func (s *FileStore) Get(id string) (io.ReadCloser, error) {
 	return f, nil
 }
 
+// Delete unlinks a chunk and syncs the directory. An absent name returns an error
+// wrapping os.ErrNotExist; the controller client treats the resulting 404 as an
+// acknowledged, idempotent deletion.
 func (s *FileStore) Delete(id string) error {
 	if !validChunkID(id) {
 		return ErrInvalidChunk

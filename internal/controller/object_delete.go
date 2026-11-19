@@ -10,6 +10,9 @@ var ErrDeletionIncomplete = errors.New(
 	"could not remove all chunk replicas",
 )
 
+// DeleteObject records a tombstone before removing replicas from all four workers.
+// An incomplete deletion retains metadata for a later DELETE retry; repair and
+// ordinary reads must not make that object visible again.
 func (s *ObjectService) DeleteObject(
 	ctx context.Context,
 	id string,

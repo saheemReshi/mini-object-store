@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+// MemoryStore implements Store for one controller process. It is safe for
+// concurrent callers, but its metadata and deletion tombstones do not survive exit.
 type MemoryStore struct {
 	mu      sync.RWMutex
 	objects map[string]Object
@@ -19,6 +21,8 @@ func NewMemoryStore() *MemoryStore {
 	}
 }
 
+// Copy nested maps and slices as well as the struct. Otherwise callers could
+// mutate stored metadata through a returned reference without taking the mutex.
 func cloneObject(obj Object) Object {
 	cloned := obj
 
@@ -216,7 +220,8 @@ func (m *MemoryStore) UpdateChunkReplicas(
 			continue
 		}
 
-		// Reject stale replica-location updates.
+		// Compare while holding the same mutex used for publication and deletion
+		// state. A stale repair must not replace newer placement information.
 		if !slices.Equal(chunk.Replicas, expected) {
 			return ErrReplicaConflict
 		}

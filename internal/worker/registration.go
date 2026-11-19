@@ -13,6 +13,8 @@ import (
 
 var ErrNotRegistered = errors.New("controller does not recognize worker")
 
+// Register advertises this worker's reachable HTTP base URL. Retrying the same
+// ID/address pair is accepted; callers supply the request deadline through ctx.
 func Register(
 	ctx context.Context,
 	client *http.Client,
@@ -66,6 +68,8 @@ func Register(
 	return nil
 }
 
+// Heartbeat refreshes membership. ErrNotRegistered means the caller must register
+// again, rather than continuing to send heartbeats to an empty controller registry.
 func Heartbeat(
 	ctx context.Context,
 	client *http.Client,

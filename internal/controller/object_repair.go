@@ -11,6 +11,8 @@ import (
 	"mini-object-store/internal/metadata"
 )
 
+// RunRepair checks replicas periodically until ctx is canceled. Pass a positive
+// interval; each scan finishes before the next one starts in this goroutine.
 func (s *ObjectService) RunRepair(
 	ctx context.Context,
 	interval time.Duration,
@@ -31,6 +33,8 @@ func (s *ObjectService) RunRepair(
 	}
 }
 
+// RepairOnce retries orphan cleanup and scans live objects. Per-chunk failures
+// are logged; a nil result does not guarantee that every object is recoverable.
 func (s *ObjectService) RepairOnce(
 	ctx context.Context,
 ) error {
@@ -45,7 +49,8 @@ func (s *ObjectService) RepairOnce(
 			return err
 		}
 
-		// Exclusive object lock: prevent concurrent deletion.
+		// Hold the object lock across worker RPCs and metadata publication so a
+		// concurrent DELETE cannot remove data that this repair would resurrect.
 		unlock := s.locks.lock(entry.ID, true)
 
 		obj, err := s.store.GetObject(ctx, entry.ID)
@@ -136,6 +141,8 @@ func (s *ObjectService) repairChunk(
 		return
 	}
 	if len(valid) == 0 {
+		// A previous repair may have written data but failed to publish metadata.
+		// Search those untracked locations before declaring the chunk lost.
 		for _, w := range workers {
 			if w.Status != "healthy" || containsWorker(chunk.Replicas, w.ID) {
 				continue
@@ -192,7 +199,8 @@ func (s *ObjectService) repairChunk(
 			continue
 		}
 
-		// Publish the new placement atomically.
+		// Compare-and-swap the old ordered placement. A future persistent Store
+		// must check both placement and the tombstone in the same transaction.
 		err := s.store.UpdateChunkReplicas(
 			ctx,
 			objectID,

@@ -19,6 +19,8 @@ func (s *ObjectService) cleanup(targets []replicaTarget) {
 		s.pendingCleanup[target] = struct{}{}
 	}
 	s.cleanupMu.Unlock()
+	// The original upload context may already be canceled. Give rollback its
+	// own bounded lifetime so disconnecting a client does not skip cleanup.
 	ctx, cancel := context.WithTimeout(
 		context.Background(), 10*time.Second,
 	)
@@ -58,6 +60,8 @@ func (s *ObjectService) retryCleanup(ctx context.Context, targets []replicaTarge
 }
 
 func (s *ObjectService) repairCleanup(ctx context.Context) {
+	// Limit orphan work per scan so an unreachable worker does not consume all
+	// of the time available for checking replicas of successfully stored objects.
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	s.cleanupMu.Lock()

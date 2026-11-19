@@ -19,6 +19,8 @@ var (
 	ErrReplicationFailed   = errors.New("chunk replication failed")
 )
 
+// Upload creates a new object and publishes metadata only after both replicas of
+// every chunk acknowledge storage. A failed upload is queued for physical cleanup.
 func (s *ObjectService) Upload(
 	ctx context.Context,
 	name, contentType string,
@@ -26,7 +28,7 @@ func (s *ObjectService) Upload(
 	src io.Reader,
 ) (metadata.Object, error) {
 
-	// 1. Obtain a snapshot of healthy workers.
+	// Obtain a snapshot of healthy workers.
 	healthy := make([]Worker, 0)
 	for _, w := range s.registry.List() {
 		if w.Status == "healthy" {
@@ -38,7 +40,7 @@ func (s *ObjectService) Upload(
 		return metadata.Object{}, ErrInsufficientWorkers
 	}
 
-	// 2. Generate an unpredictable unique object ID.
+	// Generate an unpredictable unique object ID.
 	var randomID [16]byte
 	if _, err := rand.Read(randomID[:]); err != nil {
 		return metadata.Object{}, err
@@ -58,12 +60,14 @@ func (s *ObjectService) Upload(
 	targets := make([]replicaTarget, 0)
 	var totalSize int64
 
-	// 3. Read the input file incrementally.
+	// Read the input file incrementally.
 	for index := 0; ; index++ {
 		if err := ctx.Err(); err != nil {
 			s.cleanup(targets)
 			return metadata.Object{}, err
 		}
+		// EOF means no next chunk; ErrUnexpectedEOF carries a valid final partial
+		// chunk. This also avoids creating a zero-byte chunk for an empty object.
 		n, readErr := io.ReadFull(src, buffer)
 
 		if errors.Is(readErr, io.EOF) {
@@ -84,7 +88,8 @@ func (s *ObjectService) Upload(
 		digest := sha256.Sum256(data)
 		chunkID := fmt.Sprintf("%s-%d", id, index)
 
-		// 4. Select two distinct workers.
+		// Rotate placement across workers; adjacent positions are distinct because
+		// the healthy snapshot contains at least two registered worker IDs.
 		first := (start + index) % len(healthy)
 
 		replicas := [2]Worker{
@@ -92,10 +97,12 @@ func (s *ObjectService) Upload(
 			healthy[(first+1)%len(healthy)],
 		}
 
-		// 5. Replicate concurrently.
+		// Replicate concurrently.
 		results := make(chan error, 2)
 
 		for _, w := range replicas {
+			// Record attempts before sending: a failed response does not prove the
+			// worker failed to publish, so cleanup must include uncertain writes.
 			targets = append(targets, replicaTarget{
 				address: w.Address,
 				chunkID: chunkID,
@@ -108,7 +115,8 @@ func (s *ObjectService) Upload(
 			}(w)
 		}
 
-		// Wait for BOTH replicas to finish.
+		// Join both requests before advancing. PutChunk separately owns its HTTP
+		// body bytes, so transport cleanup cannot retain our reusable buffer.
 		var writeErr error
 		for j := 0; j < 2; j++ {
 			if err := <-results; err != nil {
@@ -124,7 +132,7 @@ func (s *ObjectService) Upload(
 			)
 		}
 
-		// 6. Record the successfully replicated chunk.
+		// Record the successfully replicated chunk.
 		chunks = append(chunks, metadata.Chunk{
 			ID:       chunkID,
 			Index:    index,
@@ -143,7 +151,7 @@ func (s *ObjectService) Upload(
 		}
 	}
 
-	// 7. Publish complete object metadata.
+	// Publish complete object metadata.
 	now := time.Now().UTC()
 
 	obj := metadata.Object{
