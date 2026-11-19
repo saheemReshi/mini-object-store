@@ -1,0 +1,27 @@
+# Keep the build context small and free of local state. Source (cmd/, internal/)
+# and module files (go.mod, go.sum) must NOT be excluded.
+.git
+.gitignore
+.dockerignore
+.vscode
+.idea
+
+# Local runtime data and databases
+data
+tmp
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Test artifacts
+*.test
+coverage.out
+tests
+
+# Local environment / secrets
+.env
+.env.*
+
+*.md
