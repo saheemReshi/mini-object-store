@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -60,6 +62,24 @@ func TestMultiProcess(t *testing.T) {
 			_ = p.cmd.Wait()
 		}
 	}
+	// terminate sends SIGTERM (as `docker stop` does) and requires a clean exit.
+	terminate := func(p *process) {
+		t.Helper()
+		if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- p.cmd.Wait() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("graceful shutdown exited with %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			_ = p.cmd.Process.Kill()
+			t.Fatal("process ignored SIGTERM")
+		}
+	}
 	start := func(index int, name string, env []string) {
 		t.Helper()
 		listeners[index].Close()
@@ -85,7 +105,10 @@ func TestMultiProcess(t *testing.T) {
 			}
 		})
 	}
-	controllerEnv := []string{"CONTROLLER_ADDR=" + addresses[0]}
+	// The controller gets its own database file inside this test's temporary
+	// directory, so separate test runs never share metadata.
+	dbPath := filepath.Join(root, "controller-data", "metadata.db")
+	controllerEnv := []string{"CONTROLLER_ADDR=" + addresses[0], "METADATA_BACKEND=sqlite", "METADATA_DB_PATH=" + dbPath}
 	start(0, "controller", controllerEnv)
 	api := "http://" + addresses[0]
 	client := &http.Client{Timeout: 8 * time.Second}
@@ -305,24 +328,130 @@ func TestMultiProcess(t *testing.T) {
 		t.Fatal("deleted object still downloadable")
 	}
 	t.Log("metadata get/list/patch and deletion verified; every worker directory empty")
-	// Explicitly verify the documented in-memory restart behavior, while
-	// retaining worker disks. Never garbage-collect these now-unknown chunks.
-	orphan := upload([]byte("in-memory metadata restart check"))
+	// --- Controller restart with persistent SQLite metadata -----------------
+	// Worker disks are unchanged; the registry is rebuilt by re-registration.
+	second := make([]byte, 2_100_001)
+	if _, err := rand.Read(second); err != nil {
+		t.Fatal(err)
+	}
+	original = second // validCopies/physicalCopies/checkDownload compare against this.
+	obj = upload(second)
+	objectPath = "/api/v1/objects/" + obj.ID
+	status, body, err = request("PATCH", objectPath+"/metadata", "application/json", bytes.NewBufferString(`{"custom_metadata":{"owner":"carol","persisted":"yes"}}`))
+	if err != nil || status != 200 {
+		t.Fatalf("patch before restart: %d %v %s", status, err, body)
+	}
+	beforeRestart, _ := readMetadata()
+
+	expectPersisted := func(label string) {
+		t.Helper()
+		waitHealthy()
+		current, ok := readMetadata()
+		if !ok || current.CustomMetadata["owner"] != "carol" || current.CustomMetadata["persisted"] != "yes" ||
+			current.Checksum != beforeRestart.Checksum || len(current.Chunks) != 3 ||
+			!current.ModifiedAt.Equal(beforeRestart.ModifiedAt) {
+			t.Fatalf("%s: metadata not persisted: %+v", label, current)
+		}
+		status, body, err := request("GET", "/api/v1/objects", "", nil)
+		var listing struct {
+			Objects []metadata.Object `json:"objects"`
+		}
+		if err != nil || status != 200 || json.Unmarshal(body, &listing) != nil ||
+			len(listing.Objects) != 1 || listing.Objects[0].ID != obj.ID {
+			t.Fatalf("%s: listing after restart: %s", label, body)
+		}
+		checkDownload(label)
+	}
+
+	terminate(processes[0]) // Graceful: SIGTERM closes the database.
+	start(0, "controller", controllerEnv)
+	expectPersisted("controller graceful restart")
+
+	stop(processes[0]) // Crash: SIGKILL with no deferred cleanup.
+	start(0, "controller", controllerEnv)
+	expectPersisted("controller crash restart")
+	t.Log("controller restart: workers re-registered; SQLite metadata, patch and download intact")
+
+	// Repair still works on persisted metadata after the restart.
+	victim = obj.Chunks[1].Replicas[0]
+	stop(processes[indices[victim]])
+	checkDownload("worker stopped after controller restart")
+	wait("repair after controller restart", 30*time.Second, func() bool {
+		current, ok := readMetadata()
+		if !ok {
+			return false
+		}
+		for _, chunk := range current.Chunks {
+			for _, id := range chunk.Replicas {
+				if id == victim {
+					return false
+				}
+			}
+		}
+		return validCopies(current)
+	})
+
+	// --- Incomplete deletion survives a controller restart -------------------
+	// The victim worker is still down, so DELETE cannot reach every worker and
+	// must leave a persistent tombstone.
+	status, body, err = request("DELETE", objectPath, "", nil)
+	if err != nil || status != 503 {
+		t.Fatalf("delete with worker down: %d %v %s", status, err, body)
+	}
 	stop(processes[0])
 	start(0, "controller", controllerEnv)
+	start(indices[victim], "worker", workerEnvs[victim])
 	waitHealthy()
-	status, _, err = request("GET", "/api/v1/objects/"+orphan.ID+"/metadata", "", nil)
-	if err != nil || status != 404 {
-		t.Fatal("unexpected metadata persistence after controller restart")
+	if status, _, err := request("GET", objectPath+"/metadata", "", nil); err != nil || status != 503 {
+		t.Fatalf("tombstone not persisted across restart: %d %v", status, err)
 	}
-	copies := 0
-	for _, dir := range dirs {
-		if _, err := os.Stat(filepath.Join(dir, orphan.Chunks[0].ID)); err == nil {
-			copies++
+	status, body, err = request("GET", "/api/v1/objects", "", nil)
+	if err != nil || status != 200 || strings.Contains(string(body), obj.ID) {
+		t.Fatalf("tombstone listed after restart: %s", body)
+	}
+	status, body, err = request("DELETE", objectPath, "", nil)
+	if err != nil || status != 204 {
+		t.Fatalf("delete retry after restart: %d %v %s", status, err, body)
+	}
+	for id, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("%s retry deletion left files: %v %v", id, entries, err)
 		}
 	}
-	if copies != 2 {
-		t.Fatal("controller restart unexpectedly removed worker data")
+	if status, _, err := request("GET", objectPath+"/metadata", "", nil); err != nil || status != 404 {
+		t.Fatalf("deleted object metadata still present: %d %v", status, err)
 	}
-	t.Log("controller restart: workers re-registered; metadata lost as designed; worker data retained")
+	t.Log("incomplete deletion: tombstone survived restart; DELETE retry removed every replica")
+
+	// --- An unusable database location fails startup clearly ----------------
+	notADir := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bad := exec.Command(binaries["controller"])
+	bad.Env = append(os.Environ(), "CONTROLLER_ADDR=127.0.0.1:0", "METADATA_DB_PATH="+filepath.Join(notADir, "metadata.db"))
+	output, err := runWithTimeout(bad, 15*time.Second)
+	if err == nil || !strings.Contains(string(output), "METADATA_DB_PATH") {
+		t.Fatalf("controller started with unusable database path: err=%v output=%s", err, output)
+	}
+	t.Log("unusable METADATA_DB_PATH rejected at startup")
+}
+
+func runWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return output.Bytes(), err
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		<-done
+		return output.Bytes(), nil // Still running: treat as (wrong) success.
+	}
 }
