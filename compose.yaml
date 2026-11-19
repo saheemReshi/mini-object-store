@@ -1,0 +1,88 @@
+# One controller and four workers, each with its own named volume.
+#
+#   docker compose up --build -d     # build and start (add --wait to block until healthy)
+#   docker compose ps                # health status
+#   docker compose down              # stop and remove containers; KEEPS volumes
+#   docker compose down -v           # ALSO deletes all stored data (not for persistence tests)
+#
+# Containers reach each other by service name on the default Compose network.
+# Only the controller is published to the host.
+
+name: mini-object-store
+
+x-worker: &worker
+  build:
+    context: .
+    target: worker
+  restart: unless-stopped
+  stop_grace_period: 15s
+  depends_on:
+    controller:
+      condition: service_healthy
+  # Workers also retry registration on their own; depends_on only orders startup.
+
+x-worker-env: &worker-env
+  WORKER_ADDR: ":8081"            # all interfaces inside the container, not 127.0.0.1
+  WORKER_DATA_DIR: /data/chunks
+  CONTROLLER_URL: http://controller:8080
+
+services:
+  controller:
+    build:
+      context: .
+      target: controller
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      CONTROLLER_ADDR: ":8080"
+      METADATA_BACKEND: sqlite
+      # The whole /data directory is the volume, so the -wal/-shm companion
+      # files are persisted alongside metadata.db.
+      METADATA_DB_PATH: /data/metadata.db
+    ports:
+      - "${CONTROLLER_PORT:-8080}:8080"
+    volumes:
+      - controller_data:/data
+
+  worker1:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker1
+      WORKER_ADVERTISE_URL: http://worker1:8081
+    volumes:
+      - worker1_data:/data
+
+  worker2:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker2
+      WORKER_ADVERTISE_URL: http://worker2:8081
+    volumes:
+      - worker2_data:/data
+
+  worker3:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker3
+      WORKER_ADVERTISE_URL: http://worker3:8081
+    volumes:
+      - worker3_data:/data
+
+  worker4:
+    <<: *worker
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker4
+      WORKER_ADVERTISE_URL: http://worker4:8081
+    volumes:
+      - worker4_data:/data
+
+volumes:
+  controller_data:
+  worker1_data:
+  worker2_data:
+  worker3_data:
+  worker4_data:
