@@ -7,67 +7,6 @@ import (
 	"net/http"
 )
 
-type Handler struct {
-	registry *Registry
-	objects  *ObjectService
-}
-
-func NewHandler(
-	registry *Registry,
-	objects *ObjectService,
-) http.Handler {
-	h := &Handler{
-		registry: registry,
-		objects:  objects,
-	}
-
-	mux := http.NewServeMux()
-
-	mux.HandleFunc(
-		"POST /internal/workers/register",
-		h.registerWorker,
-	)
-
-	// Diagnostic endpoint to inspect the registry.
-	mux.HandleFunc(
-		"GET /internal/workers",
-		h.listWorkers,
-	)
-	mux.HandleFunc(
-		"POST /internal/workers/heartbeat",
-		h.heartbeatWorker,
-	)
-
-	if objects != nil {
-		mux.HandleFunc(
-			"POST /api/v1/objects",
-			h.uploadObject,
-		)
-		mux.HandleFunc(
-			"GET /api/v1/objects/{object_id}",
-			h.downloadObject,
-		)
-		mux.HandleFunc(
-			"GET /api/v1/objects/{object_id}/metadata",
-			h.getObjectMetadata,
-		)
-		mux.HandleFunc(
-			"PATCH /api/v1/objects/{object_id}/metadata",
-			h.patchObjectMetadata,
-		)
-		mux.HandleFunc(
-			"DELETE /api/v1/objects/{object_id}",
-			h.deleteObject,
-		)
-		mux.HandleFunc(
-			"GET /api/v1/objects",
-			h.listObjects,
-		)
-	}
-
-	return mux
-}
-
 func (h *Handler) heartbeatWorker(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -176,18 +115,5 @@ func (h *Handler) listWorkers(
 		Workers []Worker `json:"workers"`
 	}{
 		Workers: h.registry.List(),
-	})
-}
-
-func writeError(
-	w http.ResponseWriter,
-	status int,
-	message string,
-) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"error": message,
 	})
 }

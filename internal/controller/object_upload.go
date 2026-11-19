@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
-	"sync"
 	"time"
 
 	"mini-object-store/internal/metadata"
@@ -20,93 +18,6 @@ var (
 	ErrInsufficientWorkers = errors.New("fewer than two healthy workers")
 	ErrReplicationFailed   = errors.New("chunk replication failed")
 )
-
-type ObjectService struct {
-	registry       *Registry
-	store          metadata.Store
-	client         *WorkerClient
-	locks          *objectLockTable
-	cleanupMu      sync.Mutex
-	cleanupRunMu   sync.Mutex
-	pendingCleanup map[replicaTarget]struct{}
-}
-
-func NewObjectService(
-	registry *Registry,
-	store metadata.Store,
-	client *WorkerClient,
-) *ObjectService {
-	return &ObjectService{
-		registry:       registry,
-		store:          store,
-		client:         client,
-		locks:          newObjectLockTable(),
-		pendingCleanup: make(map[replicaTarget]struct{}),
-	}
-}
-
-type replicaTarget struct {
-	address string
-	chunkID string
-}
-
-// Failed cleanup is retained until a later repair pass can reach the worker.
-// Like object metadata, this queue is intentionally in memory only.
-func (s *ObjectService) cleanup(targets []replicaTarget) {
-	s.cleanupMu.Lock()
-	for _, target := range targets {
-		s.pendingCleanup[target] = struct{}{}
-	}
-	s.cleanupMu.Unlock()
-	ctx, cancel := context.WithTimeout(
-		context.Background(), 10*time.Second,
-	)
-	defer cancel()
-	s.retryCleanup(ctx, targets)
-}
-
-func (s *ObjectService) retryCleanup(ctx context.Context, targets []replicaTarget) {
-	// Serialize retries so an old successful DELETE cannot acknowledge a newer
-	// failed attempt for the same target. Chunk IDs are unique across uploads.
-	s.cleanupRunMu.Lock()
-	defer s.cleanupRunMu.Unlock()
-	for _, target := range targets {
-		if ctx.Err() != nil {
-			return
-		}
-		s.cleanupMu.Lock()
-		_, pending := s.pendingCleanup[target]
-		s.cleanupMu.Unlock()
-		if !pending {
-			continue
-		}
-		err := s.client.DeleteChunk(
-			ctx, target.address, target.chunkID,
-		)
-		if err != nil {
-			log.Printf(
-				"cleanup %s on %s: %v",
-				target.chunkID, target.address, err,
-			)
-		} else {
-			s.cleanupMu.Lock()
-			delete(s.pendingCleanup, target)
-			s.cleanupMu.Unlock()
-		}
-	}
-}
-
-func (s *ObjectService) repairCleanup(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	s.cleanupMu.Lock()
-	targets := make([]replicaTarget, 0, len(s.pendingCleanup))
-	for target := range s.pendingCleanup {
-		targets = append(targets, target)
-	}
-	s.cleanupMu.Unlock()
-	s.retryCleanup(ctx, targets)
-}
 
 func (s *ObjectService) Upload(
 	ctx context.Context,

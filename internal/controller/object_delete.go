@@ -4,49 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-
-	"mini-object-store/internal/metadata"
 )
 
 var ErrDeletionIncomplete = errors.New(
 	"could not remove all chunk replicas",
 )
-
-func (s *ObjectService) GetMetadata(
-	ctx context.Context,
-	id string,
-) (metadata.Object, error) {
-	unlock := s.locks.lock(id, false)
-	defer unlock()
-
-	obj, err := s.store.GetObject(ctx, id)
-	if err != nil {
-		return metadata.Object{}, err
-	}
-
-	if obj.Deleting {
-		return metadata.Object{}, metadata.ErrObjectDeleting
-	}
-
-	return obj, nil
-}
-
-func (s *ObjectService) ListObjects(
-	ctx context.Context,
-) ([]metadata.Object, error) {
-	return s.store.ListObjects(ctx)
-}
-
-func (s *ObjectService) PatchMetadata(
-	ctx context.Context,
-	id string,
-	patch map[string]string,
-) (metadata.Object, error) {
-	unlock := s.locks.lock(id, true)
-	defer unlock()
-
-	return s.store.PatchCustomMetadata(ctx, id, patch)
-}
 
 func (s *ObjectService) DeleteObject(
 	ctx context.Context,
