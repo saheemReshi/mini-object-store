@@ -73,7 +73,8 @@ func (h *Handler) putChunk(w http.ResponseWriter, r *http.Request) {
 	copy(expectedHash[:], decoded)
 
 	// HTTP request body is an io.Reader.
-	err = h.store.Put(
+	err = h.store.PutContext(
+		r.Context(),
 		id,
 		r.Body,
 		r.ContentLength,

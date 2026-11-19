@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 )
 
 const ChunkSize int64 = 1_000_000
@@ -138,8 +140,20 @@ func (s *FileStore) Put(
 	expectedSize int64,
 	expectedHash [32]byte,
 ) error {
+	return s.PutContext(context.Background(), id, src, expectedSize, expectedHash)
+}
+
+// PutContext serializes the entire write with deletion, including staging.
+// Cancellation observed before publication leaves no chunk behind. Cancellation
+// racing the publication syscall still requires controller-side cleanup.
+func (s *FileStore) PutContext(ctx context.Context, id string, src io.Reader, expectedSize int64, expectedHash [32]byte) error {
 	if !validChunkID(id) || expectedSize <= 0 || expectedSize > ChunkSize {
 		return ErrInvalidChunk
+	}
+	unlock := s.lockChunk(id, true)
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// 1. Create a temporary file inside the storage directory.
@@ -182,8 +196,9 @@ func (s *FileStore) Put(
 	}
 
 	// 5. Synchronize publication with Get, Delete and List.
-	unlock := s.lockChunk(id, true)
-	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Publish without overwriting an existing chunk.
 	finalPath := filepath.Join(s.rootDir, id)
 
@@ -223,7 +238,7 @@ func (s *FileStore) Get(id string) (io.ReadCloser, error) {
 
 	path := filepath.Join(s.rootDir, id)
 
-	f, err := os.Open(path)
+	f, err := openChunk(path)
 	if err != nil {
 		return nil, fmt.Errorf("open chunk %s: %w", id, err)
 	}
@@ -241,6 +256,13 @@ func (s *FileStore) Delete(id string) error {
 	path := filepath.Join(s.rootDir, id)
 
 	if err := os.Remove(path); err != nil {
+		// A previous unlink may have succeeded but failed its directory sync.
+		// Retry the sync before acknowledging that the chunk is absent.
+		if errors.Is(err, os.ErrNotExist) {
+			if syncErr := syncDirectory(s.rootDir); syncErr != nil {
+				return fmt.Errorf("sync absent chunk: %w", syncErr)
+			}
+		}
 		return fmt.Errorf("delete chunk %s: %w", id, err)
 	}
 
@@ -257,14 +279,14 @@ func verifyExisting(
 	expectedSize int64,
 	expectedHash [32]byte,
 ) error {
-	f, err := os.Open(path)
+	f, err := openChunk(path)
 	if err != nil {
 		return fmt.Errorf("open existing chunk: %w", err)
 	}
 	defer f.Close()
 
 	hasher := sha256.New()
-	n, err := io.Copy(hasher, f)
+	n, err := io.Copy(hasher, io.LimitReader(f, expectedSize+1))
 	if err != nil {
 		return fmt.Errorf("read existing chunk: %w", err)
 	}
@@ -275,6 +297,24 @@ func verifyExisting(
 	}
 
 	return nil
+}
+
+// O_NOFOLLOW rejects symlinks; O_NONBLOCK prevents a malicious FIFO from
+// blocking before Stat can reject it. The storage directory itself is trusted.
+func openChunk(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, ErrInvalidChunk
+	}
+	return f, nil
 }
 
 func syncDirectory(dir string) error {

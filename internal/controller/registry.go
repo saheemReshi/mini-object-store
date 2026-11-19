@@ -10,7 +10,7 @@ import (
 
 var (
 	ErrInvalidWorker  = errors.New("invalid worker registration")
-	ErrWorkerConflict = errors.New("worker ID already registered with a different address")
+	ErrWorkerConflict = errors.New("worker ID or address conflicts with an existing registration")
 	ErrWorkerNotFound = errors.New("worker not registered")
 )
 
@@ -49,6 +49,11 @@ func (r *Registry) Register(
 	defer r.mu.Unlock()
 
 	now := time.Now().UTC()
+	for otherID, worker := range r.workers {
+		if otherID != id && worker.Address == address {
+			return Worker{}, false, ErrWorkerConflict
+		}
+	}
 
 	if existing, ok := r.workers[id]; ok {
 		if existing.Address != address {
@@ -61,7 +66,7 @@ func (r *Registry) Register(
 		existing.Status = "registered"
 
 		r.workers[id] = existing
-		return existing, false, nil
+		return cloneWorker(existing), false, nil
 	}
 
 	worker := Worker{
@@ -75,6 +80,14 @@ func (r *Registry) Register(
 	r.workers[id] = worker
 	return worker, true, nil
 
+}
+
+func cloneWorker(w Worker) Worker {
+	if w.LastHeartbeat != nil {
+		heartbeat := *w.LastHeartbeat
+		w.LastHeartbeat = &heartbeat
+	}
+	return w
 }
 
 func (r *Registry) List() []Worker {
@@ -95,7 +108,7 @@ func (r *Registry) List() []Worker {
 			worker.Status = "healthy"
 		}
 
-		result = append(result, worker)
+		result = append(result, cloneWorker(worker))
 	}
 
 	sort.Slice(result, func(i, j int) bool {

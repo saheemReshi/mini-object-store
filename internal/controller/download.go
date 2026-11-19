@@ -38,6 +38,9 @@ func (s *ObjectService) fetchChunk(
 	// Still try unavailable workers afterward: status may be stale.
 	for _, preferHealthy := range []bool{true, false} {
 		for _, workerID := range chunk.Replicas {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			worker, exists := workers[workerID]
 			if !exists {
 				continue
@@ -57,6 +60,9 @@ func (s *ObjectService) fetchChunk(
 			)
 			if err == nil {
 				return data, nil
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
 
 			log.Printf(

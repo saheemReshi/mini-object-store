@@ -39,6 +39,11 @@ type Object struct {
 	Deleting       bool              `json:"-"`
 }
 
+// Store implementations must return detached snapshots and make each mutation
+// atomic: a returned error must leave metadata unchanged. Replica updates compare
+// the expected ordered placement and reject deleting objects in the same atomic
+// operation. ListObjects hides tombstones; GetObject retains them for DELETE retry.
+// These semantics also apply to the future SQLite implementation.
 type Store interface {
 	CreateObject(ctx context.Context, obj Object) error
 	GetObject(ctx context.Context, id string) (Object, error)

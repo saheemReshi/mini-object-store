@@ -37,6 +37,8 @@ func main() {
 		Addr:              addr,
 		Handler:           controller.NewHandler(registry, objectService),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	log.Printf("controller listening on %s", addr)

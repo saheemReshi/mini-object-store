@@ -67,25 +67,12 @@ func (s *ObjectService) DeleteObject(
 
 	workers := s.registry.List()
 
-	// Strict policy for our fixed four-worker deployment:
-	// require all workers to be reachable before deletion.
-	if len(workers) != 4 {
-		return fmt.Errorf(
-			"%w: expected four registered workers",
-			ErrDeletionIncomplete,
-		)
-	}
-
-	for _, w := range workers {
-		if w.Status != "healthy" {
-			return fmt.Errorf(
-				"%w: worker %s unavailable",
-				ErrDeletionIncomplete, w.ID,
-			)
-		}
-	}
-
+	// Keep the tombstone until every worker in the fixed deployment has
+	// acknowledged deletion, including workers holding old untracked replicas.
 	var deleteErrors []error
+	if len(workers) != 4 {
+		deleteErrors = append(deleteErrors, errors.New("expected four registered workers"))
+	}
 
 	// Delete tracked and untracked copies on ALL workers.
 	for _, chunk := range obj.Chunks {

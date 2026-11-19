@@ -34,6 +34,7 @@ func (s *ObjectService) RunRepair(
 func (s *ObjectService) RepairOnce(
 	ctx context.Context,
 ) error {
+	s.repairCleanup(ctx)
 	objects, err := s.store.ListObjects(ctx)
 	if err != nil {
 		return err
@@ -95,15 +96,14 @@ func (s *ObjectService) repairChunk(
 		byID[w.ID] = w
 	}
 
-	var source string
 	var data []byte
-	valid := 0
+	valid := make([]string, 0, 2)
 
 	// Check both recorded replicas.
 	for _, workerID := range chunk.Replicas {
 		w, exists := byID[workerID]
 
-		if !exists || w.Status != "healthy" {
+		if !exists || w.Status != "healthy" || containsWorker(valid, workerID) {
 			continue
 		}
 
@@ -123,91 +123,134 @@ func (s *ObjectService) repairChunk(
 			continue
 		}
 
-		valid++
-
 		// Retain one verified source for repair.
-		if source == "" {
-			source = workerID
+		if len(valid) == 0 {
 			data = b
 		}
+		valid = append(valid, workerID)
 	}
 
 	// Both replicas verified successfully.
-	if valid >= 2 {
+	if len(valid) >= 2 {
+		s.removeExtraReplicas(ctx, chunk, valid, workers)
 		return
 	}
-
-	// No source exists from which to reconstruct the chunk.
-	if valid == 0 {
-		log.Printf(
-			"UNRECOVERABLE: no valid replica for %s",
-			chunk.ID,
-		)
-		return
+	if len(valid) == 0 {
+		for _, w := range workers {
+			if w.Status != "healthy" || containsWorker(chunk.Replicas, w.ID) {
+				continue
+			}
+			b, err := s.client.GetChunk(ctx, w.Address, chunk.ID, chunk.Size, checksum)
+			if err == nil {
+				valid = append(valid, w.ID)
+				data = b
+				break
+			}
+		}
 	}
 
-	// Find a healthy worker not already in replica metadata.
-	for _, w := range workers {
-		if w.Status != "healthy" ||
-			containsWorker(chunk.Replicas, w.ID) {
+	// Prefer spare workers, then allow restoring a bad recorded replica when
+	// there is no spare. Probe existing copies first: a returning worker can
+	// hold a verified copy no longer recorded in metadata.
+	candidates := make([]Worker, 0, len(workers))
+	for _, recorded := range []bool{false, true} {
+		for _, w := range workers {
+			if w.Status == "healthy" && !containsWorker(valid, w.ID) &&
+				containsWorker(chunk.Replicas, w.ID) == recorded {
+				candidates = append(candidates, w)
+			}
+		}
+	}
+	newTargets := make([]replicaTarget, 0)
+	for _, w := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		b, getErr := s.client.GetChunk(ctx, w.Address, chunk.ID, chunk.Size, checksum)
+		if getErr != nil {
+			if len(valid) == 0 || (!errors.Is(getErr, ErrChunkCorrupt) && !errors.Is(getErr, ErrChunkNotFound)) {
+				continue
+			}
+			if errors.Is(getErr, ErrChunkCorrupt) {
+				if err := s.client.DeleteChunk(ctx, w.Address, chunk.ID); err != nil {
+					continue
+				}
+			}
+			// Track even ambiguous PUT failures; a timeout can follow publication.
+			if !containsWorker(chunk.Replicas, w.ID) {
+				newTargets = append(newTargets, replicaTarget{address: w.Address, chunkID: chunk.ID})
+			}
+			if err := s.client.PutChunk(ctx, w.Address, chunk.ID, data, checksum); err != nil {
+				log.Printf("replacement %s on %s failed: %v", chunk.ID, w.ID, err)
+				continue
+			}
+		} else if len(valid) == 0 {
+			data = b
+		}
+		valid = append(valid, w.ID)
+		if len(valid) < 2 {
 			continue
 		}
-
-		// Upload the verified bytes.
-		err := s.client.PutChunk(
-			ctx, w.Address, chunk.ID, data, checksum,
-		)
-		if err != nil {
-			log.Printf(
-				"replacement %s on %s failed: %v",
-				chunk.ID, w.ID, err,
-			)
-			continue
-		}
-
-		replacement := []string{source, w.ID}
 
 		// Publish the new placement atomically.
-		err = s.store.UpdateChunkReplicas(
+		err := s.store.UpdateChunkReplicas(
 			ctx,
 			objectID,
 			chunk.ID,
 			chunk.Replicas,
-			replacement,
+			valid,
 		)
 
 		if err != nil {
-			// Roll back the newly written replica if metadata
-			// publication failed.
-			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
-			)
-
-			if cleanupErr := s.client.DeleteChunk(
-				cleanupCtx, w.Address, chunk.ID,
-			); cleanupErr != nil {
-				log.Printf(
-					"cleanup replacement %s on %s: %v",
-					chunk.ID, w.ID, cleanupErr,
-				)
-			}
-			cancel()
-
+			// Never remove a restored replica already referenced by metadata.
+			s.rollbackRepair(newTargets)
 			log.Printf("replica metadata update failed: %v", err)
 			return
 		}
 
 		log.Printf(
 			"repaired %s: %v -> %v",
-			chunk.ID, chunk.Replicas, replacement,
+			chunk.ID, chunk.Replicas, valid,
 		)
+		// Failed attempts on other destinations may also have published data.
+		// Reconciliation retries their removal while this object exists.
+		s.removeExtraReplicas(ctx, chunk, valid, workers)
 		return
 	}
 
+	s.rollbackRepair(newTargets)
 	log.Printf(
-		"under-replicated %s: no suitable destination",
-		chunk.ID,
+		"under-replicated %s: %d verified replicas", chunk.ID, len(valid),
 	)
+}
+
+// Unlike failed-upload chunks, these belong to a live object. Do not enqueue
+// delayed DELETEs: a future repair may adopt one of these untracked copies.
+// Any failed rollback is reconciled by a later scan (or object deletion).
+func (s *ObjectService) rollbackRepair(targets []replicaTarget) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, target := range targets {
+		if err := s.client.DeleteChunk(ctx, target.address, target.chunkID); err != nil {
+			log.Printf("rollback repair %s on %s: %v", target.chunkID, target.address, err)
+		}
+	}
+}
+
+// Called only after two distinct copies have been verified and their locations
+// committed. The object lock prevents deletion/repair from racing this cleanup.
+func (s *ObjectService) removeExtraReplicas(ctx context.Context, chunk metadata.Chunk, keep []string, workers []Worker) {
+	for _, w := range workers {
+		if ctx.Err() != nil {
+			return
+		}
+		if w.Status != "healthy" || containsWorker(keep, w.ID) {
+			continue
+		}
+		if err := s.client.DeleteChunk(ctx, w.Address, chunk.ID); err != nil {
+			log.Printf("remove stale replica %s on %s: %v", chunk.ID, w.ID, err)
+		}
+	}
 }
 
 func containsWorker(ids []string, id string) bool {

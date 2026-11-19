@@ -31,7 +31,9 @@ type WorkerClient struct {
 
 func NewWorkerClient() *WorkerClient {
 	return &WorkerClient{
-		http: &http.Client{},
+		http: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
 	}
 }
 
@@ -72,6 +74,9 @@ func (c *WorkerClient) PutChunk(
 		sha256.Sum256(data) != checksum {
 		return ErrChunkCorrupt
 	}
+	// A transport may still read/close the request body after Do returns.
+	// Own the bytes so Upload can safely reuse its chunk buffer on any result.
+	data = bytes.Clone(data)
 
 	ctx, cancel := context.WithTimeout(ctx, workerRequestTimeout)
 	defer cancel()
@@ -111,6 +116,9 @@ func (c *WorkerClient) GetChunk(
 	expectedSize int64,
 	expectedHash [32]byte,
 ) ([]byte, error) {
+	if expectedSize <= 0 || expectedSize > storage.ChunkSize {
+		return nil, ErrChunkCorrupt
+	}
 	ctx, cancel := context.WithTimeout(ctx, workerRequestTimeout)
 	defer cancel()
 

@@ -46,6 +46,9 @@ func main() {
 		Addr:              addr,
 		Handler:           worker.NewHandler(store, workerID),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	client := &http.Client{}
