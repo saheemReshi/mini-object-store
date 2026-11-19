@@ -130,10 +130,12 @@ download/delete/repair; chunk operations; locks; and metadata CRUD.
 
 ## Remaining limits and untested failure models
 
-- **No restart persistence:** object metadata, registry entries, deletion intent,
-  and pending failed-upload cleanup are in memory. A controller crash can orphan
-  chunks or lose an incomplete deletion. Startup deliberately does not erase
-  unknown worker files; that would destroy potentially recoverable data.
+- **Partial restart persistence:** with the SQLite backend, object metadata,
+  placement and deletion tombstones survive restarts (see "SQLite and container
+  deployment" below). Registry entries are rebuilt by worker re-registration.
+  Pending failed-upload cleanup is still in memory, so a controller crash during
+  an upload can orphan chunks. Startup deliberately does not erase unknown worker
+  files; that would destroy potentially recoverable data.
 - **No distributed fencing:** cancellation can race publication, or a delayed PUT
   may start after cleanup DELETE. Local locking/context checks cannot eliminate
   this failure model. Durable worker tombstones or generation tokens plus a
@@ -166,39 +168,84 @@ download/delete/repair; chunk operations; locks; and metadata CRUD.
   disk hardware errors were not fault-injected. Abrupt worker death during staging
   can leave hidden temporary files; these are excluded from inventory and are not
   automatically swept. Only one worker process should own each storage directory.
-- **Deployment:** Dockerfiles/Compose were absent, so container stop/start and
-  volume behavior were not tested or added in this correctness pass. Real local
-  subprocess failure/restart was tested instead. The binaries still rely on
-  process termination rather than coordinated graceful cluster shutdown.
+- **Deployment:** a Dockerfile and `compose.yaml` now exist (see below). Both
+  binaries shut down their HTTP servers on SIGTERM/SIGINT and the controller stops
+  repair and closes the database first; there is still no coordinated
+  cluster-wide shutdown.
 
-## Future SQLite integration
+## SQLite and container deployment (roadmap milestones 1–5)
 
-Keep the `metadata.Store` method signatures. Required semantics are now documented
-on the interface:
+### Decisions
 
-1. Create object metadata, ordered chunks, checksums, custom metadata, and all
-   replica rows in one transaction. No partial object publication.
-2. Return detached snapshots. Preserve deterministic chunk order and object
-   listing, UTC timestamps, errors, custom-metadata merge behavior, and tombstone
-   filtering.
-3. Persist `MarkDeleting` before removing physical chunks. Keep tombstoned rows
-   available to `GetObject` and DELETE retry; reject patch and replica updates.
-4. In `UpdateChunkReplicas`, check current ordered placement and deletion state,
-   enforce two distinct worker IDs, and replace locations in one transaction.
-5. A mutation error must not mean that a partial/uncertain commit was published:
-   upload/repair rollback relies on that contract. Resolve SQLite transaction
-   outcomes before returning. Honor cancellation and configure transaction/busy
-   behavior so operations do not hold locks indefinitely.
-6. Retain these tests as backend contract tests when the SQLite store is added.
-   Persistence alone does not recover the current in-memory upload cleanup queue.
-   A persistent cleanup journal, worker membership restoration/reconciliation,
-   and an explicit way to enumerate/resume deletion tombstones are additional
-   work for restart-safe recovery. Do not silently expose tombstones through the
-   ordinary object-list API.
+- **Driver:** `modernc.org/sqlite` (pure Go). Chosen before the container build
+  so that `CGO_ENABLED=0` works: both binaries are static, the build needs no C
+  toolchain or `libsqlite3`, and the runtime image needs no C library. A cgo
+  driver would have required a matching build/runtime libc.
+- **Schema:** `internal/metadata/schema.sql`, embedded and applied idempotently
+  (`CREATE ... IF NOT EXISTS`) on every start; version recorded in
+  `PRAGMA user_version`, and a database from a newer schema is refused. Tables:
+  `objects` (custom metadata as JSON, `deleting` flag), `chunks` (unique index and
+  chunk ID within an object), `replicas` (ordered `slot`, unique worker per
+  chunk). Timestamps are RFC 3339 with nanoseconds in UTC.
+- **Concurrency:** one pooled connection, so all transactions in the controller
+  are serialized. Compare-and-swap in `UpdateChunkReplicas` (existence, tombstone,
+  ordered placement, replacement) runs in one transaction; result sets are closed
+  before the next query in the same transaction. Every Store call is bounded by
+  a 10-second operation timeout (including the wait for the connection), and
+  `busy_timeout` bounds waits on locks held by another process. Write
+  transactions never span worker HTTP requests.
+- **Durability:** WAL journal with `synchronous=FULL`; the whole `/data`
+  directory is the volume so `-wal`/`-shm` files persist with the database.
+- **Atomicity:** every mutation is one transaction that rolls back on any error,
+  including a canceled context; duplicate IDs are detected inside the
+  transaction. `DeleteObject` removes replica and chunk rows explicitly as well
+  as via `ON DELETE CASCADE`.
+- **Controller wiring:** `METADATA_BACKEND` (`sqlite` default, `memory` only when
+  requested) and `METADATA_DB_PATH` (default `./data/controller/metadata.db`).
+  Open/schema failures stop startup; there is no silent fallback.
+- **Images:** one multi-stage Dockerfile with `controller` and `worker` targets on
+  Alpine, non-root user, exec-form entrypoint (signals reach the binary),
+  busybox `wget` healthchecks. Compose: five services, five named volumes,
+  service-name URLs, `restart: unless-stopped`, workers start after the
+  controller is healthy and still retry registration on their own.
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| `go test ./internal/metadata -race` | Contract suite passes for MemoryStore and SQLite (round trip incl. empty objects and ns timestamps, duplicates/missing IDs, detached snapshots, sorted listing hiding tombstones, patch merge, tombstone rejection, ordered CAS, 8-way concurrent CAS with exactly one winner, canceled operations change nothing). SQLite-only: close/reopen of a real file keeps objects, patches, placement and tombstones; deletion leaves no manifest rows; rejected creates leave no rows; unusable/garbage/newer-schema files fail to open. |
+| `go test ./... -count=1`, `go test -race ./... -count=1`, `go vet ./...`, `gofmt -l` | All pass; no race reports; no findings. |
+| `OBJECTSTORE_PROCESS_E2E=1 ... TestMultiProcess` | Passed (~65 s). Original scenarios plus: graceful and SIGKILL controller restarts with metadata, patch and SHA-256 download intact; repair after restart; incomplete deletion tombstone persisted across restart and completed by DELETE retry; unusable `METADATA_DB_PATH` rejected at startup. |
+| `docker compose config -q` | Valid. |
+| `OBJECTSTORE_COMPOSE_E2E=1 ... TestComposeStack` | Written to cover every scenario in roadmap milestone 5; must be run on a machine with a Docker daemon. |
+
+The tests above were run in an environment without network access or a Docker
+daemon: the Go checks used a temporary stand-in for the SQLite driver (the same
+SQL running on SQLite 3.53 through a minimal local binding), and images were not
+built. After `go mod tidy`, re-run the Go checks with the real driver and run
+`docker compose up --build` and the Compose test before submission.
+
+### Recovery follow-ups
+
+| Follow-up | Status |
+| --- | --- |
+| Tombstones persisted; explicit DELETE retry after restart | Implemented and tested. |
+| Automatic resumption of pending deletions | Not implemented. Needs a separate recovery listing; `ListObjects` deliberately hides tombstones and `Store` was not changed. |
+| Durable failed-upload journal | Not implemented. `pendingCleanup` is still in memory; a controller crash during an upload can leave unreferenced chunk files. |
+| Delayed PUT fencing | Not implemented. Needs worker-side generations or tombstones; metadata persistence cannot order remote writes. |
+
+Persistence therefore does **not** make every upload or deletion crash-safe.
 
 ## Suggested commit messages
 
 - `fix: preserve chunk integrity and reconcile replica recovery`
 - `test: cover object-store failure recovery and real process lifecycle`
 
-No commits or pushes were performed.
+For the SQLite and deployment work:
+
+1. `feat(metadata): add transactional SQLite store and contract tests`
+2. `feat(controller): persist metadata across controller restarts`
+3. `build: add controller and worker container images`
+4. `feat(deploy): add Compose stack with persistent volumes`
+5. `test: verify container failure recovery and database persistence`
+6. `docs: document SQLite setup and container demonstrations`

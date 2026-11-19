@@ -13,8 +13,8 @@ chunks and stores replicated copies on four HTTP storage workers.
 | Chunk size | 1 MB = 1,000,000 bytes; the final chunk may be smaller |
 | Replication | Two copies of each chunk on distinct registered workers |
 | Integrity | SHA-256 per chunk and for the complete object |
-| Metadata | In-memory `metadata.Store` implementation; SQLite is not implemented |
-| Deployment | Local binaries; Docker/Compose deployment remains to be added |
+| Metadata | SQLite database file (`metadata.Store`); an in-memory store remains for tests |
+| Deployment | Local binaries, or Docker Compose with five containers and five named volumes |
 
 Upload metadata is published only after every chunk has two acknowledged copies.
 Empty objects have zero chunks. Downloads try another replica if a worker fails or
@@ -27,15 +27,35 @@ controller runs a repair scan every 15 seconds to restore replication where a
 verified source is available and remove stale extra copies from healthy workers.
 Detection and repair also take time to complete worker HTTP requests.
 
-**Controller metadata does not survive a restart.** Worker files remain on disk,
-but existing objects cannot be retrieved through a new empty metadata store.
-Workers re-register automatically; that does not reconstruct object metadata.
+**Controller metadata survives restarts.** Object metadata, chunk manifests,
+replica placement, custom metadata and deletion tombstones are stored in a SQLite
+file (`METADATA_DB_PATH`). After a controller restart, workers re-register on
+their next heartbeat and existing objects download normally. The worker registry
+itself stays in memory and is rebuilt by that re-registration.
+
+The in-memory backend (`METADATA_BACKEND=memory`) is still available for quick
+experiments and is used by most unit tests. With it, **metadata is lost when the
+controller exits**: worker files stay on disk but can no longer be retrieved.
+
+SQLite driver choice: [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite),
+a pure-Go translation of SQLite. It needs no C compiler or system SQLite library,
+so both binaries build with `CGO_ENABLED=0` as static executables and the container
+images stay simple. The trade-off is a larger dependency and somewhat slower
+queries than the cgo driver, which is irrelevant at this project's scale.
 
 ## Run locally
 
 Requirements: Linux, Bash, Go 1.27.4 or later (see `go.mod`), and free ports
 8080 through 8084. The API examples also use `curl`, Python 3, and GNU coreutils
-(`sha256sum` and `cmp`). No external Go modules or database server are required.
+(`sha256sum` and `cmp`). No database server is required: SQLite runs inside the
+controller process. The only external Go module is the SQLite driver.
+
+After cloning, or whenever `go.sum` is missing driver entries, fetch modules once
+(requires network access):
+
+```bash
+go mod tidy
+```
 
 Run all commands from the repository root. Build both binaries into the ignored
 `tmp/` directory:
@@ -49,8 +69,17 @@ go build -o tmp/bin/worker ./cmd/worker
 Start the controller in one terminal:
 
 ```bash
-CONTROLLER_ADDR=127.0.0.1:8080 ./tmp/bin/controller
+CONTROLLER_ADDR=127.0.0.1:8080 \
+METADATA_DB_PATH=./data/controller/metadata.db \
+./tmp/bin/controller
 ```
+
+The database file and its parent directory are created if missing. If the
+location cannot be opened (for example, it is below a regular file or not
+writable), the controller exits with an error naming `METADATA_DB_PATH`; it never
+falls back to in-memory metadata. Stop the controller with Ctrl+C (or SIGTERM) to
+close the database cleanly; SQLite's write-ahead log also makes an abrupt kill
+safe for committed metadata.
 
 Open four more terminals. In each one, run the following with `i` set to a
 different value: **1, 2, 3, or 4**.
@@ -80,6 +109,89 @@ curl --fail --silent --show-error http://127.0.0.1:8080/internal/workers \
 Registration alone reports `registered`; the first successful heartbeat makes the
 worker healthy. Uploads need at least two healthy workers. Completing deletion
 uses the fixed four-worker deployment, including stale copies from earlier repair.
+
+## Run with Docker Compose
+
+Requirements: Docker Engine with the Compose v2 plugin (`docker compose`). The
+images are built from source, so the first build needs network access to pull
+`golang` and `alpine` base images and Go modules (`go.sum` must be up to date; see
+`go mod tidy` above).
+
+```bash
+docker compose config -q          # validate compose.yaml
+docker compose up --build -d --wait
+docker compose ps                 # all five services should be "healthy"
+curl --fail --silent --show-error http://127.0.0.1:8080/internal/workers | python3 -m json.tool
+```
+
+`--wait` blocks until every container's healthcheck passes. Wait for all four
+workers to report `healthy` in `/internal/workers` before uploading. The
+upload/download/metadata examples below work unchanged against the Compose stack
+because the controller is published on host port 8080 (override with
+`CONTROLLER_PORT=9090 docker compose up -d`).
+
+| Service | Image target | Listens on | Advertised / internal URL | Volume |
+| --- | --- | --- | --- | --- |
+| `controller` | `controller` | `:8080` (published) | `http://controller:8080` | `controller_data:/data` (holds `metadata.db`, `-wal`, `-shm`) |
+| `worker1`–`worker4` | `worker` | `:8081` (not published) | `http://workerN:8081` | `workerN_data:/data` (chunks in `/data/chunks`) |
+
+Containers talk to each other by Compose service name; workers listen on all
+interfaces inside their container so the controller can reach them. Each service
+has its own named volume, so the same internal path and port are safe to reuse.
+Containers run as an unprivileged `app` user, and the binaries are PID 1 so
+`docker stop` delivers SIGTERM for a clean shutdown.
+
+Stopping and starting:
+
+```bash
+docker compose stop               # stop containers, keep them
+docker compose start
+docker compose down               # remove containers and network; volumes are KEPT
+docker compose up -d --wait       # new containers reattach to the same volumes
+docker compose down -v            # ALSO deletes every volume, i.e. all stored objects
+```
+
+Never use `down -v` when you want data to survive. `docker volume ls` shows the
+five `mini-object-store_*` volumes.
+
+### Demonstrations with containers
+
+Use an uploaded object's ID (see the examples below) in `OBJECT_ID`.
+
+Worker failure and recovery. Downloads keep working from the other replica; within
+about 25 seconds repair copies affected chunks to a spare worker. When the worker
+returns, its disk is intact and its now-extra copies are removed by reconciliation:
+
+```bash
+docker compose stop worker2
+curl -fsS "http://127.0.0.1:8080/api/v1/objects/$OBJECT_ID" | sha256sum
+sleep 30
+curl -fsS "http://127.0.0.1:8080/api/v1/objects/$OBJECT_ID/metadata" | python3 -m json.tool
+docker compose start worker2
+docker compose exec worker2 ls -l /data/chunks
+```
+
+Corruption. Overwrite the first bytes of a stored chunk (pick a chunk ID and one
+of its replica workers from the metadata). The download still verifies, and the
+next repair scan restores two verified copies:
+
+```bash
+CHUNK_ID=...; W=worker1
+docker compose exec -T "$W" sh -c "printf '\377\377\377\377' | dd of=/data/chunks/$CHUNK_ID bs=1 count=4 conv=notrunc"
+docker compose exec -T "$W" sha256sum "/data/chunks/$CHUNK_ID"
+curl -fsS "http://127.0.0.1:8080/api/v1/objects/$OBJECT_ID" | sha256sum
+```
+
+Controller restart and container recreation. Metadata comes back from the
+`controller_data` volume and chunks from the worker volumes:
+
+```bash
+docker compose restart controller
+docker compose down && docker compose up -d --wait
+curl -fsS "http://127.0.0.1:8080/api/v1/objects/$OBJECT_ID/metadata" | python3 -m json.tool
+```
+
+Logs: `docker compose logs -f controller` or `docker compose logs worker3`.
 
 ## Upload, download, and metadata examples
 
@@ -139,6 +251,8 @@ curl --fail --silent --show-error -X PATCH \
 
 Inspect physical chunk inventory by contacting a worker directly. For example,
 worker1 listens on port 8081; inventory reports IDs and sizes, not verified hashes.
+(With Compose, worker ports are not published; use
+`docker compose exec worker1 wget -qO- http://127.0.0.1:8081/internal/workers/worker1/chunks`.)
 
 ```bash
 curl --fail --silent --show-error \
@@ -157,6 +271,8 @@ A successful deletion returns 204. If a worker cannot acknowledge removal, the
 controller returns 503 and retains a deletion tombstone. The object is hidden from
 listing, download, and metadata updates. Restore the worker and retry the same
 DELETE; background repair does not resume tombstoned deletions automatically.
+The tombstone is stored in SQLite, so the retry also works after a controller
+restart.
 The temporary original, download, and upload response remain in `demo_dir` for
 inspection after the distributed object is deleted.
 
@@ -202,6 +318,8 @@ Controller environment:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CONTROLLER_ADDR` | `:8080` | HTTP listen address |
+| `METADATA_BACKEND` | `sqlite` | `sqlite`, or `memory` for non-persistent metadata |
+| `METADATA_DB_PATH` | `./data/controller/metadata.db` | SQLite database file; its directory also holds `-wal`/`-shm` files |
 
 Worker environment:
 
@@ -242,9 +360,15 @@ internal/metadata/
   models.go                Object and chunk data structures
   store.go                 Store interface and shared errors
   memory.go                In-memory implementation
+  sqlite.go, schema.sql    SQLite implementation and its schema
+  sqlite_driver.go         Selected SQLite driver (modernc.org/sqlite)
+  contract_test.go         Store contract tests run against both backends
 internal/storage/          Chunk files, atomic publication, and chunk locks
 internal/worker/           Chunk HTTP handlers and membership client
 tests/process_test.go      Opt-in test of the actual distributed binaries
+tests/compose_test.go      Opt-in test of the Docker Compose deployment
+Dockerfile                 Multi-stage build with controller and worker targets
+compose.yaml               One controller, four workers, five named volumes
 ```
 
 Per-object locks coordinate download reconstruction, metadata updates, deletion,
@@ -272,33 +396,60 @@ repair rollback, and deletion retries. The real-process test is skipped unless
 explicitly enabled:
 
 ```bash
-OBJECTSTORE_PROCESS_E2E=1 go test ./tests -run '^TestMultiProcess$' -v -count=1 -timeout=120s
+OBJECTSTORE_PROCESS_E2E=1 go test ./tests -run '^TestMultiProcess$' -v -count=1 -timeout=5m
 ```
 
 This test builds and starts one controller and four workers, uploads random binary
 data larger than 2 MB, checks SHA-256 and physical replication, stops/restarts a
 worker, verifies automatic repair, corrupts a replica, patches metadata, deletes
-the object, and checks controller restart behavior. It takes about 50 seconds
+the object, and then checks SQLite persistence: after both a graceful (SIGTERM)
+and a crash (SIGKILL) controller restart, workers re-register and the object's
+metadata, patch and download are intact; repair still works; an incomplete
+deletion's tombstone survives a restart and an explicit DELETE retry completes
+it; and an unusable `METADATA_DB_PATH` fails startup. It takes about 65 seconds
 because it uses real heartbeat and repair intervals. It manages only its own
-processes and temporary data, and cleans them up automatically.
+processes, ports, database file and temporary data.
+
+The metadata package runs one contract suite (`contract_test.go`) against both
+MemoryStore and SQLite, plus SQLite-only tests that close and reopen a real
+database file, check for leftover manifest rows, and reject unusable files.
+
+The Compose test needs a Docker daemon and is also opt-in:
+
+```bash
+OBJECTSTORE_COMPOSE_E2E=1 go test ./tests -run '^TestComposeStack$' -v -count=1 -timeout=20m
+```
+
+It builds the images and starts the stack under a unique Compose project name and
+a free host port, so it never touches your own `mini-object-store` containers or
+volumes. It checks stable worker IDs, a >2 MB upload (ordered chunks, final
+partial chunk, two distinct replicas, whole-object checksum), download, worker
+stop with repair, worker restart with stale-copy reconciliation, a corrupted
+replica, metadata CRUD, controller restart, full container recreation
+(`down` + `up`), and an incomplete deletion that survives a controller restart
+before an explicit retry removes every chunk. Cleanup runs `down -v` for the test
+project only; set `OBJECTSTORE_COMPOSE_KEEP=1` to leave it running.
 
 ## Current limits and planned work
 
-- SQLite persistence and Docker/Compose deployment are not implemented.
-- Controller restart loses metadata, deletion tombstones, and pending failed-upload
-  cleanup. Remaining worker files are not automatically erased or reconstructed
-  into objects.
+- Persistence covers controller metadata, not every in-flight operation. The
+  failed-upload cleanup queue is still in memory: if the controller dies between
+  writing chunks and publishing (or cleaning up) an upload, those chunks remain
+  as unreferenced files. Startup deliberately does not erase unknown worker files.
+- Tombstoned deletions are not resumed automatically after a restart; they are
+  hidden and must be finished with an explicit DELETE retry.
 - Repair needs a surviving verified copy. Losing every copy of a chunk is
   unrecoverable; normal replication protects against one replica loss.
-- Incomplete deletion requires an explicit DELETE retry. Permanent worker removal
-  and changing a registered worker's address need an additional membership policy.
+- Permanent worker removal and changing a registered worker's address need an
+  additional membership policy; deletion expects all four workers.
 - Local locking and cancellation do not fence arbitrarily delayed distributed
   PUTs. Durable worker tombstones/generations and a persistent cleanup journal
   would be needed for a strict no-resurrection guarantee.
+- The SQLite store uses one database connection, so metadata operations are
+  serialized. That is ample for one controller and keeps compare-and-swap simple;
+  it is not designed for several controllers sharing one database.
 - Internal HTTP APIs assume a trusted deployment; authentication and TLS are not
   implemented. Each storage directory must belong to one worker process.
 
-The future SQLite implementation should preserve `metadata.Store`, including
-atomic publication, detached snapshots, tombstone filtering, and transactional
-replica compare-and-swap. See [REVIEW.md](REVIEW.md) for the detailed correctness
-review, verified results, remaining failure models, and persistence contract.
+See [REVIEW.md](REVIEW.md) for the detailed correctness review, verified results,
+remaining failure models, and the persistence contract.
