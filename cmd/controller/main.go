@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,10 +34,7 @@ func openStore() (metadata.Store, io.Closer, error) {
 	backend := strings.ToLower(strings.TrimSpace(os.Getenv("METADATA_BACKEND")))
 	switch backend {
 	case "", "sqlite":
-		path := os.Getenv("METADATA_DB_PATH")
-		if path == "" {
-			path = defaultMetadataDBPath
-		}
+		path := metadataDBPath()
 		store, err := metadata.OpenSQLiteStore(path)
 		if err != nil {
 			return nil, nil, fmt.Errorf("open metadata database (METADATA_DB_PATH=%q): %w", path, err)
@@ -71,6 +69,10 @@ func run() error {
 		addr = ":8080"
 	}
 
+	request, err := prepareStartupGC()
+	if err != nil {
+		return err
+	}
 	metaStore, closer, err := openStore()
 	if err != nil {
 		return err
@@ -94,18 +96,36 @@ func run() error {
 		workerClient,
 	)
 
-	// Background replication and integrity repair, stopped before the store
-	// is closed.
-	var repair sync.WaitGroup
-	repair.Add(1)
+	// No client operation or repair can begin before requested maintenance.
+	var ready atomic.Bool
+	ready.Store(request == nil)
+	var background sync.WaitGroup
+	background.Add(1)
+	maintenanceErr := make(chan error, 1)
 	go func() {
-		defer repair.Done()
+		defer background.Done()
+		if request != nil {
+			log.Printf("gc: requested mode=%s path=%s", request.options.Mode, request.path)
+			if _, err := objectService.CollectOrphans(ctx, request.options); err != nil {
+				maintenanceErr <- fmt.Errorf("startup GC failed (request retained): %w", err)
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if err := request.complete(); err != nil {
+				maintenanceErr <- fmt.Errorf("complete GC request: %w", err)
+				return
+			}
+			ready.Store(true)
+			log.Printf("gc: complete; request removed; object API ready")
+		}
 		objectService.RunRepair(ctx, 15*time.Second)
 	}()
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           controller.NewHandler(registry, objectService),
+		Handler:           withStartupGate(controller.NewHandler(registry, objectService), &ready),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       2 * time.Minute,
 		IdleTimeout:       60 * time.Second,
@@ -120,17 +140,22 @@ func run() error {
 	select {
 	case err = <-serveErr:
 		// Listener failed (for example, port in use).
+	case err = <-maintenanceErr:
+		// Keep the request and stop rather than open client traffic after failure.
 	case <-ctx.Done():
-		log.Printf("controller shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		err = shutdownServer(shutdownCtx, server)
-		cancel()
 	}
-	stop() // Also stops repair if the listener failed.
-	repair.Wait()
+	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		err = nil
+	}
+	stop() // Cancel GC timers/RPCs and repair before closing the store.
+	log.Printf("controller shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	shutdownErr := shutdownServer(shutdownCtx, server)
+	cancel()
+	background.Wait()
 
 	if errors.Is(err, http.ErrServerClosed) {
 		err = nil
 	}
-	return err
+	return errors.Join(err, shutdownErr)
 }

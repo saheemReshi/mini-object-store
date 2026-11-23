@@ -85,6 +85,8 @@ func (s *ObjectService) Download(
 	ctx context.Context,
 	id string,
 ) (*os.File, metadata.Object, error) {
+	s.maintenance.RLock()
+	defer s.maintenance.RUnlock()
 	unlock := s.locks.lock(id, false)
 	defer unlock()
 

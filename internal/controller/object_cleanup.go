@@ -12,7 +12,8 @@ type replicaTarget struct {
 }
 
 // Failed cleanup is retained until a later repair pass can reach the worker.
-// Like object metadata, this queue is intentionally in memory only.
+// The queue is in memory only; explicit startup GC can reclaim unreferenced
+// published chunks if a controller crash loses these cleanup attempts.
 func (s *ObjectService) cleanup(targets []replicaTarget) {
 	s.cleanupMu.Lock()
 	for _, target := range targets {

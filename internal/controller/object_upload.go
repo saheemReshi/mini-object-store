@@ -27,6 +27,8 @@ func (s *ObjectService) Upload(
 	custom map[string]string,
 	src io.Reader,
 ) (metadata.Object, error) {
+	s.maintenance.RLock()
+	defer s.maintenance.RUnlock()
 
 	// Obtain a snapshot of healthy workers.
 	healthy := make([]Worker, 0)

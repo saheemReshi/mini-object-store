@@ -39,6 +39,8 @@ services:
       # The whole /data directory is the volume, so the -wal/-shm companion
       # files are persisted alongside metadata.db.
       METADATA_DB_PATH: /data/metadata.db
+      # GC only runs when an operator creates this request in controller_data.
+      GC_REQUEST_PATH: /data/gc.request
     ports:
       - "${CONTROLLER_PORT:-8080}:8080"
     volumes:

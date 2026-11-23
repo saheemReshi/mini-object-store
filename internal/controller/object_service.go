@@ -9,6 +9,7 @@ import (
 // ObjectService coordinates object metadata and worker replicas. Callers should
 // share one service instance so its object locks protect every operation.
 type ObjectService struct {
+	maintenance    sync.RWMutex // GC excludes object operations, including repair.
 	registry       *Registry
 	store          metadata.Store
 	client         *WorkerClient

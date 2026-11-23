@@ -38,6 +38,8 @@ func (s *ObjectService) RunRepair(
 func (s *ObjectService) RepairOnce(
 	ctx context.Context,
 ) error {
+	s.maintenance.RLock()
+	defer s.maintenance.RUnlock()
 	s.repairCleanup(ctx)
 	objects, err := s.store.ListObjects(ctx)
 	if err != nil {

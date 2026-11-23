@@ -11,6 +11,8 @@ func (s *ObjectService) GetMetadata(
 	ctx context.Context,
 	id string,
 ) (metadata.Object, error) {
+	s.maintenance.RLock()
+	defer s.maintenance.RUnlock()
 	unlock := s.locks.lock(id, false)
 	defer unlock()
 
@@ -30,6 +32,8 @@ func (s *ObjectService) GetMetadata(
 func (s *ObjectService) ListObjects(
 	ctx context.Context,
 ) ([]metadata.Object, error) {
+	s.maintenance.RLock()
+	defer s.maintenance.RUnlock()
 	return s.store.ListObjects(ctx)
 }
 
@@ -39,6 +43,8 @@ func (s *ObjectService) PatchMetadata(
 	id string,
 	patch map[string]string,
 ) (metadata.Object, error) {
+	s.maintenance.RLock()
+	defer s.maintenance.RUnlock()
 	unlock := s.locks.lock(id, true)
 	defer unlock()
 

@@ -167,6 +167,13 @@ func (c *WorkerClient) DeleteChunk(
 	ctx context.Context,
 	address, id string,
 ) error {
+	_, err := c.deleteChunk(ctx, address, id)
+	return err
+}
+
+// deleteChunk distinguishes removal from absence for GC accounting. Existing
+// callers retain DeleteChunk's idempotent API.
+func (c *WorkerClient) deleteChunk(ctx context.Context, address, id string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, workerRequestTimeout)
 	defer cancel()
 
@@ -174,21 +181,22 @@ func (c *WorkerClient) DeleteChunk(
 		ctx, http.MethodDelete, chunkURL(address, id), nil,
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("DELETE chunk on %s: %w", address, err)
+		return false, fmt.Errorf("DELETE chunk on %s: %w", address, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNoContent ||
-		resp.StatusCode == http.StatusNotFound {
-		return nil
+	if resp.StatusCode == http.StatusNoContent {
+		return true, nil
 	}
-
-	return statusError(resp)
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	return false, statusError(resp)
 }
 
 type WorkerInventory struct {

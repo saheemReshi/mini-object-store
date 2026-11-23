@@ -17,6 +17,8 @@ func (s *ObjectService) DeleteObject(
 	ctx context.Context,
 	id string,
 ) error {
+	s.maintenance.RLock()
+	defer s.maintenance.RUnlock()
 	unlock := s.locks.lock(id, true)
 	defer unlock()
 

@@ -108,7 +108,8 @@ func TestMultiProcess(t *testing.T) {
 	// The controller gets its own database file inside this test's temporary
 	// directory, so separate test runs never share metadata.
 	dbPath := filepath.Join(root, "controller-data", "metadata.db")
-	controllerEnv := []string{"CONTROLLER_ADDR=" + addresses[0], "METADATA_BACKEND=sqlite", "METADATA_DB_PATH=" + dbPath}
+	controllerEnv := []string{"CONTROLLER_ADDR=" + addresses[0], "METADATA_BACKEND=sqlite", "METADATA_DB_PATH=" + dbPath,
+		"GC_REQUEST_PATH=" + filepath.Join(filepath.Dir(dbPath), "gc.request")}
 	start(0, "controller", controllerEnv)
 	api := "http://" + addresses[0]
 	client := &http.Client{Timeout: 8 * time.Second}
@@ -424,13 +425,68 @@ func TestMultiProcess(t *testing.T) {
 	}
 	t.Log("incomplete deletion: tombstone survived restart; DELETE retry removed every replica")
 
+	// --- Manual startup GC and a worker registering late --------------------
+	original = []byte("committed object survives manual maintenance")
+	obj = upload(original)
+	objectPath = "/api/v1/objects/" + obj.ID
+	const orphan = "obj-cccccccccccccccccccccccccccccccc-0"
+	for _, dir := range dirs {
+		if err := os.WriteFile(filepath.Join(dir, orphan), []byte("orphan"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop(processes[0])
+	stop(processes[indices["worker4"]])
+	gcPath := filepath.Join(filepath.Dir(dbPath), "gc.request")
+	if err := os.WriteFile(gcPath, []byte(`{"mode":"delete","grace_period":"250ms","worker_wait_timeout":"15s"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	start(0, "controller", controllerEnv)
+	wait("GC gates object API while waiting for late worker", 10*time.Second, func() bool {
+		status, body, err := request("GET", "/api/v1/objects", "", nil)
+		return err == nil && status == 503 && strings.Contains(string(body), "garbage collection")
+	})
+	if status, _, err := request("GET", "/internal/workers", "", nil); err != nil || status != 200 {
+		t.Fatal("GC blocked registration/health", status, err)
+	}
+	start(indices["worker4"], "worker", workerEnvs["worker4"])
+	waitHealthy()
+	wait("manual GC finished and API resumed", 20*time.Second, func() bool {
+		status, _, err := request("GET", "/api/v1/objects", "", nil)
+		return err == nil && status == 200
+	})
+	if _, err := os.Stat(gcPath); !os.IsNotExist(err) {
+		t.Fatal("successful request not removed", err)
+	}
+	for _, dir := range dirs {
+		if _, err := os.Stat(filepath.Join(dir, orphan)); !os.IsNotExist(err) {
+			t.Fatal("orphan not reclaimed", err)
+		}
+	}
+	checkDownload("manual GC with late registration")
+	if err := os.WriteFile(filepath.Join(dirs["worker1"], orphan), []byte("no request"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	terminate(processes[0])
+	start(0, "controller", controllerEnv)
+	waitHealthy()
+	if _, err := os.Stat(filepath.Join(dirs["worker1"], orphan)); err != nil {
+		t.Fatal("ordinary startup ran GC", err)
+	}
+	logData, _ := os.ReadFile(processes[0].log.Name())
+	if strings.Contains(string(logData), "gc: requested") {
+		t.Fatal("ordinary startup scheduled GC")
+	}
+	checkDownload("ordinary restart skips GC")
+	t.Log("manual GC waited for late worker, reclaimed orphan files, preserved committed data, and did not repeat without a request")
+
 	// --- An unusable database location fails startup clearly ----------------
 	notADir := filepath.Join(root, "not-a-directory")
 	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	bad := exec.Command(binaries["controller"])
-	bad.Env = append(os.Environ(), "CONTROLLER_ADDR=127.0.0.1:0", "METADATA_DB_PATH="+filepath.Join(notADir, "metadata.db"))
+	bad.Env = append(os.Environ(), "CONTROLLER_ADDR=127.0.0.1:0", "GC_REQUEST_PATH=", "METADATA_BACKEND=sqlite", "METADATA_DB_PATH="+filepath.Join(notADir, "metadata.db"))
 	output, err := runWithTimeout(bad, 15*time.Second)
 	if err == nil || !strings.Contains(string(output), "METADATA_DB_PATH") {
 		t.Fatalf("controller started with unusable database path: err=%v output=%s", err, output)

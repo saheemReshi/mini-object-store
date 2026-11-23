@@ -352,6 +352,75 @@ func TestComposeStack(t *testing.T) {
 		t.Fatal("chunk files did not survive container recreation")
 	}
 
+	// --- Explicit startup GC: dry-run, kill/start retry, then no implicit GC --
+	// Seed the on-disk state left by chunks published before an upload's
+	// metadata commit. Concurrency at that publication boundary is unit-tested.
+	const orphan = "obj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0"
+	for _, id := range workerIDs {
+		mustCompose("exec", "-T", id, "sh", "-c", "printf orphan > /data/chunks/"+orphan)
+	}
+	armGC := func(mode, grace string) {
+		t.Helper()
+		// This helper shares only the controller volume; --no-deps avoids
+		// restarting other services and no host ports are published.
+		contents := fmt.Sprintf(`{"mode":%q,"grace_period":%q,"worker_wait_timeout":"60s"}`, mode, grace)
+		mustCompose("run", "--rm", "-T", "--no-deps", "--entrypoint", "sh", "controller", "-c",
+			"printf '%s\\n' '"+contents+"' > /data/gc.request.tmp && mv /data/gc.request.tmp /data/gc.request")
+	}
+	apiReady := func() bool {
+		status, _, err := request("GET", "/api/v1/objects", "", nil)
+		return err == nil && status == 200
+	}
+	mustCompose("stop", "controller")
+	armGC("dry-run", "1s")
+	mustCompose("start", "controller")
+	waitHealthy()
+	wait("dry-run completed and client API resumed", 30*time.Second, apiReady)
+	for _, id := range workerIDs {
+		files, err := workerFiles(id)
+		if err != nil || files[orphan] == "" {
+			t.Fatalf("dry-run removed %s: %v", id, err)
+		}
+	}
+	mustCompose("exec", "-T", "controller", "sh", "-c", "test ! -e /data/gc.request")
+	checkDownload("after GC dry-run")
+	mustCompose("stop", "controller")
+	armGC("delete", "10s")
+	mustCompose("start", "controller")
+	wait("GC maintenance rejects client requests", 20*time.Second, func() bool {
+		status, body, err := request("GET", "/api/v1/objects", "", nil)
+		return err == nil && status == 503 && strings.Contains(string(body), "garbage collection")
+	})
+	wait("destructive GC entered grace period", 30*time.Second, func() bool {
+		out, err := compose("logs", "--no-color", "--tail", "30", "controller")
+		return err == nil && strings.Contains(out, "mode=delete discovered=4; grace period 10s")
+	})
+	mustCompose("kill", "-s", "SIGKILL", "controller")
+	mustCompose("start", "controller")
+	waitHealthy() // Membership is available while the object API is gated.
+	wait("GC retried after docker kill/start and API resumed", 45*time.Second, apiReady)
+	mustCompose("exec", "-T", "controller", "sh", "-c", "test ! -e /data/gc.request")
+	for _, id := range workerIDs {
+		files, err := workerFiles(id)
+		if err != nil || files[orphan] != "" {
+			t.Fatalf("GC left orphan on %s: %v", id, err)
+		}
+	}
+	checkMetadata("after destructive GC")
+	checkDownload("after destructive GC")
+	const unrequested = "obj-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0"
+	mustCompose("exec", "-T", "worker1", "sh", "-c", "printf unrequested > /data/chunks/"+unrequested)
+	mustCompose("restart", "controller")
+	waitHealthy()
+	wait("ordinary restart serves without GC", 20*time.Second, apiReady)
+	mustCompose("restart", "worker1")
+	waitHealthy()
+	if files, err := workerFiles("worker1"); err != nil || files[unrequested] == "" {
+		t.Fatal("ordinary restart/reconnect unexpectedly collected an orphan", err)
+	}
+	checkDownload("ordinary restart after GC")
+	t.Log("manual GC: dry-run preserved files; kill/start retried request; deletion reclaimed orphans; normal restarts/reconnects skipped GC")
+
 	// --- Incomplete deletion, controller restart, DELETE retry ---------------
 	down := current.Chunks[0].Replicas[1]
 	mustCompose("stop", down)
