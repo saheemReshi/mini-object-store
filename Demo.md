@@ -1,386 +1,263 @@
-# Project demonstration
+# Demo guide
 
-This walkthrough demonstrates the implemented features in presentation order.
-Read [README.md](README.md) for the architecture and consistency model.
+Run the numbered steps **in order, in one Bash terminal, from the repository
+root**. Each step says what to do and what you should observe.
 
-Use **one Bash terminal**, starting in the repository root, and run the numbered
-sections in order. Keep its variables and functions until cleanup. The main
-walkthrough uses Docker; local development instructions are at the end.
+The long setup and verification functions are now in
+[scripts/demo_helpers.sh](scripts/demo_helpers.sh). You load them once; you do not
+need to copy their implementation. The actual storage, failure, corruption, and
+GC actions remain visible below.
 
-Requirements: Docker Engine with Compose, curl, jq, Python 3, and GNU coreutils
-(sha256sum, cmp, date, and stat). The first build needs network access. Allow
-roughly 5–10 minutes after building, including real failure-detection and repair
-intervals. Every wait below has a deadline; a failed check means stop and inspect
-the logs rather than continue presenting an unverified result.
+You need Docker with Compose, curl, jq, Python 3, and GNU coreutils. Allow about
+5–10 minutes after the first image build. If a command reports an error or a wait
+times out, stop and inspect the logs before moving on.
 
-## 1. Create an isolated deployment
+| Steps | What you demonstrate |
+| --- | --- |
+| 1 | One controller and four healthy workers |
+| 2–5 | Upload, chunking, replication, verified downloads, boundary sizes, concurrency, metadata, and JSON errors |
+| 6–8 | Worker failure, automatic repair, corruption recovery, and persistent storage |
+| 9–10 | Manual GC: dry-run, maintenance responses, late workers, crash recovery, and no automatic repeat |
+| 11–13 | Persistent deletion tombstones, GC protection, deletion retry, and physical cleanup |
+| 14 and appendices | Automated checks, local startup, and cancelling a pending GC request |
 
-A unique Compose project gives this demo its own containers, network, volumes,
-and image tags. An OS-selected host port avoids the usual 8080 conflict.
+## 1. Start the system
+
+Load the helpers, create an isolated demo session, and start the containers:
 
 ~~~bash
-set -o pipefail
-command -v docker curl jq python3 sha256sum cmp
-docker compose version
+source scripts/demo_helpers.sh
+demo_init
 
-DEMO_PROJECT="mos-demo-$(date +%s)-$RANDOM"
-DEMO_DIR=$(mktemp -d /tmp/mini-object-store-demo.XXXXXX)
-CONTROLLER_PORT=$(python3 - <<'PY'
-import socket
-with socket.socket() as listener:
-    listener.bind(("127.0.0.1", 0))
-    print(listener.getsockname()[1])
-PY
-)
-export CONTROLLER_PORT
-API="http://127.0.0.1:$CONTROLLER_PORT"
-
-dc() { docker compose -p "$DEMO_PROJECT" -f compose.yaml "$@"; }
-printf 'Project: %s\nAPI: %s\nEvidence files: %s\n' "$DEMO_PROJECT" "$API" "$DEMO_DIR"
-
-dc config -q
 dc up --build -d --wait
+wait_for "four workers healthy" all_healthy
+wait_for "object API ready" api_ready
 dc ps
 ~~~
 
-The temporary port reservation ends before Docker binds; if another process takes
-it in that interval, choose a new free port and recreate this demo project.
+**Expected:** five healthy containers.
 
-Define reusable checks. These functions poll actual readiness and physical
-replicas instead of assuming a fixed sleep is long enough.
+The helper prints a unique project name, an available host port, and a temporary
+directory. It leaves other Compose projects alone. Keep this terminal open:
+later commands reuse these values.
 
-~~~bash
-wait_for() {
-    local description="$1"
-    shift
-    local deadline=$((SECONDS + 180))
-    until "$@"; do
-        if (( SECONDS >= deadline )); then
-            printf 'Timed out: %s\n' "$description" >&2
-            dc logs --no-color --tail 50 controller
-            return 1
-        fi
-        sleep 1
-    done
-    printf 'OK: %s\n' "$description"
-}
+| Name | Meaning |
+| --- | --- |
+| dc | Short for docker compose targeting only this demo project |
+| API | Controller URL |
+| DEMO_DIR | Host directory containing input files, downloads, and responses |
+| OBJECT_ID | Main uploaded object's ID, set in step 2 |
+| meta | Fetch metadata for the main object |
+| inventory worker1 | List chunk files recorded by worker1 |
+| wait_for | Retry a readiness/check command for up to three minutes |
 
-all_healthy() {
-    curl -fsS --max-time 5 "$API/internal/workers" 2>/dev/null |
-        jq -e '(.workers | length) == 4 and all(.workers[]; .status == "healthy")' >/dev/null
-}
+If Docker reports that the chosen port was taken, clean up this project using
+step 13 and start a new session. The free-port probe cannot reserve the port
+through Docker startup.
 
-api_ready() {
-    curl -fsS --max-time 5 "$API/api/v1/objects" 2>/dev/null |
-        jq -e 'has("objects")' >/dev/null
-}
+## 2. Upload a binary file
 
-meta() {
-    curl -fsS --max-time 15 "$API/api/v1/objects/$OBJECT_ID/metadata"
-}
-
-inventory() {
-    dc exec -T "$1" wget -qO- "http://127.0.0.1:8081/internal/workers/$1/chunks"
-}
-
-maintenance_active() {
-    local status
-    status=$(curl -sS --max-time 5 -D "$DEMO_DIR/maintenance.headers" \
-        -o "$DEMO_DIR/maintenance.json" -w '%{http_code}' "$API/api/v1/objects") || return 1
-    [[ "$status" == 503 ]] &&
-        jq -e '.error | contains("garbage collection")' "$DEMO_DIR/maintenance.json" >/dev/null
-}
-
-request_gc() {
-    printf '{"mode":"%s","grace_period":"%s","worker_wait_timeout":"%s"}\n' "$1" "$2" "$3" |
-        dc run --rm -T --no-deps --entrypoint sh controller \
-            -c 'cat > /data/gc.request.tmp && mv /data/gc.request.tmp /data/gc.request'
-}
-
-verify_replicas() {
-    local excluded="${1:-}" manifest chunk expected first second w record holders
-    manifest=$(meta) || return 1
-    jq -e '(.chunks | length) == .chunk_count and
-        all(.chunks[]; (.replicas | length) == 2 and .replicas[0] != .replicas[1])' \
-        <<<"$manifest" >/dev/null || return 1
-
-    while IFS=$'\t' read -r chunk expected first second; do
-        [[ "$first" != "$excluded" && "$second" != "$excluded" ]] || return 1
-        holders=0
-        for w in worker1 worker2 worker3 worker4; do
-            [[ "$w" == "$excluded" ]] && continue
-            record=$(dc exec -T "$w" sh -c \
-                'if [ -f "$1" ]; then sha256sum "$1"; else printf "absent\n"; fi' \
-                sh "/data/chunks/$chunk") || return 1
-            if [[ "$record" != absent ]]; then
-                [[ "${record%% *}" == "$expected" ]] || return 1
-                [[ "$w" == "$first" || "$w" == "$second" ]] || return 1
-                ((holders += 1))
-            fi
-        done
-        [[ "$holders" == 2 ]] || return 1
-    done < <(jq -r '.chunks[] | [.chunk_id, .checksum, .replicas[0], .replicas[1]] | @tsv' <<<"$manifest")
-}
-
-wait_for "four workers healthy" all_healthy
-wait_for "object API ready" api_ready
-curl -fsS "$API/internal/workers" | jq .
-~~~
-
-**Show:** one controller and four distinct healthy worker IDs. Containers share
-the internal worker port safely because they have separate network identities
-and volumes.
-
-## 2. Upload binary data with custom metadata
-
-Create a 2,345,679-byte random object. It must become three chunks of 1,000,000,
-1,000,000, and 345,679 bytes.
+Create the demo files, then upload the large one with custom metadata:
 
 ~~~bash
-python3 - "$DEMO_DIR/original.bin" <<'PY'
-import os
-import pathlib
-import sys
-pathlib.Path(sys.argv[1]).write_bytes(os.urandom(2_345_679))
-PY
-
-ORIGINAL_SHA=$(sha256sum "$DEMO_DIR/original.bin")
-ORIGINAL_SHA="${ORIGINAL_SHA%% *}"
+make_demo_files
 
 curl -fsS -D "$DEMO_DIR/upload.headers" \
     -F "file=@$DEMO_DIR/original.bin;type=application/octet-stream" \
     -F 'metadata={"owner":"alice","course":"cloud"}' \
     "$API/api/v1/objects" -o "$DEMO_DIR/upload.json"
 
-cat "$DEMO_DIR/upload.headers"
-jq . "$DEMO_DIR/upload.json"
 OBJECT_ID=$(jq -er '.object_id' "$DEMO_DIR/upload.json")
-
-jq -e --arg sha "$ORIGINAL_SHA" \
-    '.size == 2345679 and .chunk_count == 3 and .checksum == $sha and
-     [.chunks[].size] == [1000000, 1000000, 345679]' "$DEMO_DIR/upload.json"
+cat "$DEMO_DIR/upload.headers"
+jq '{object_id, name, size, content_type, created_at, last_modified,
+     checksum, chunk_count, custom_metadata}' "$DEMO_DIR/upload.json"
+check_upload_manifest
 ~~~
 
-**Show:** HTTP 201, generated object ID, timestamps, content type, whole-object
-checksum, custom metadata, and ordered chunk records.
+**Expected:** HTTP 201 and a new object ID. The file has 2,345,679 bytes, so its
+three ordered chunks must contain **1,000,000 + 1,000,000 + 345,679 bytes**.
+The helper checks these sizes and the whole-object SHA-256.
 
-## 3. Inspect chunk distribution and physical replication
+## 3. Show distribution and two physical replicas
+
+Display the chunk locations, then inspect each worker's inventory:
 
 ~~~bash
-meta | jq -r '.chunks[] | [.index, .chunk_id, .size, (.replicas | join(", "))] | @tsv'
-meta | jq '[.chunks[].replicas[]] | unique'
+meta | jq '.chunks[] | {index, chunk_id, size, replicas}'
 
 for w in worker1 worker2 worker3 worker4; do
-    printf '\n%s inventory:\n' "$w"
+    echo "$w"
     inventory "$w" | jq .
 done
 
-wait_for "exactly two physical, SHA-256 verified copies per chunk" verify_replicas
+wait_for "two verified physical copies per chunk" verify_replicas
 ~~~
 
-**Show:** all four workers participate in this three-chunk upload; every chunk has
-two copies on distinct workers. The verification function reads actual file
-hashes and checks them against metadata, rather than trusting the placement list.
+**Expected:** all four workers participate, and each chunk has two copies on
+different workers.
 
-## 4. Download integrity, boundary sizes, and concurrency
+verify_replicas reads the actual file hashes from worker containers and compares
+them with metadata. It also rejects extra copies; it does not just trust the
+replica list.
+
+## 4. Download files and check concurrency
+
+Download the main object and compare it with the original:
 
 ~~~bash
 curl -fsS -D "$DEMO_DIR/download.headers" \
     "$API/api/v1/objects/$OBJECT_ID" -o "$DEMO_DIR/download.bin"
+
 cat "$DEMO_DIR/download.headers"
 sha256sum "$DEMO_DIR/original.bin" "$DEMO_DIR/download.bin"
 cmp "$DEMO_DIR/original.bin" "$DEMO_DIR/download.bin"
 ~~~
 
-**Show:** HTTP 200, application/octet-stream, the original size, and matching
-hashes/bytes. cmp succeeds silently.
+**Expected:** HTTP 200, the original content type and size, matching SHA-256
+values, and no output from cmp.
 
-Exercise empty, small text, and exactly 1 MB objects as well. The main object
-already covers a multi-chunk file with a partial final chunk.
+Now run the boundary-size and concurrent-download demonstrations:
 
 ~~~bash
-python3 - "$DEMO_DIR" <<'PY'
-import os
-import pathlib
-import sys
-root = pathlib.Path(sys.argv[1])
-(root / "empty.bin").write_bytes(b"")
-(root / "small.txt").write_text("Cloud computing demo\n")
-(root / "exact-1mb.bin").write_bytes(os.urandom(1_000_000))
-PY
-
-: > "$DEMO_DIR/boundary-ids.txt"
-for name in empty.bin small.txt exact-1mb.bin; do
-    type=application/octet-stream
-    [[ "$name" == small.txt ]] && type=text/plain
-    curl -fsS -F "file=@$DEMO_DIR/$name;type=$type" \
-        "$API/api/v1/objects" -o "$DEMO_DIR/$name.json"
-    id=$(jq -er '.object_id' "$DEMO_DIR/$name.json")
-    printf '%s\n' "$id" >> "$DEMO_DIR/boundary-ids.txt"
-    size=$(stat -c %s "$DEMO_DIR/$name")
-    chunks=$(((size + 999999) / 1000000))
-    jq -e --argjson size "$size" --argjson chunks "$chunks" \
-        '.size == $size and .chunk_count == $chunks' "$DEMO_DIR/$name.json"
-    curl -fsS "$API/api/v1/objects/$id" -o "$DEMO_DIR/$name.download"
-    cmp "$DEMO_DIR/$name" "$DEMO_DIR/$name.download"
-done
-
-pids=()
-for i in 1 2 3 4; do
-    curl -fsS "$API/api/v1/objects/$OBJECT_ID" -o "$DEMO_DIR/concurrent-$i.bin" &
-    pids+=("$!")
-done
-for pid in "${pids[@]}"; do wait "$pid"; done
-for i in 1 2 3 4; do cmp "$DEMO_DIR/original.bin" "$DEMO_DIR/concurrent-$i.bin"; done
-printf 'All boundary uploads and concurrent downloads matched.\n'
+demo_boundaries
+demo_parallel_downloads
 ~~~
 
-## 5. List, retrieve, and patch metadata; inspect JSON errors
+**Expected:** the boundary table shows an empty file with zero chunks, small text
+with one chunk, and an exactly 1 MB file with one chunk. Each downloads unchanged.
+Four simultaneous downloads of the main object also match the original.
 
-Upload uses a plain metadata map. PATCH uses a custom_metadata wrapper.
+## 5. Read and update metadata; show errors
+
+List objects and retrieve the main object's complete metadata:
 
 ~~~bash
 curl -fsS "$API/api/v1/objects" | jq .
 meta | jq .
+~~~
 
+Patch custom metadata without uploading the data again:
+
+~~~bash
 curl -fsS -X PATCH -H 'Content-Type: application/json' \
     -d '{"custom_metadata":{"owner":"bob","experiment":"replication"}}' \
     "$API/api/v1/objects/$OBJECT_ID/metadata" | jq .
 
-meta | jq -e --arg sha "$ORIGINAL_SHA" \
-    '.custom_metadata.owner == "bob" and .custom_metadata.course == "cloud" and
-     .custom_metadata.experiment == "replication" and .checksum == $sha'
-curl -fsS "$API/api/v1/objects/$OBJECT_ID" -o "$DEMO_DIR/after-patch.bin"
-cmp "$DEMO_DIR/original.bin" "$DEMO_DIR/after-patch.bin"
+check_metadata_patch
+check_download after-patch
 ~~~
 
-**Show:** metadata was merged, last_modified changed, and the object data/checksum
-stayed the same.
+**Expected:** owner changes to bob, course remains cloud, experiment is added,
+and last_modified changes. The checksum and downloaded bytes remain unchanged.
+Upload accepts a plain metadata map; PATCH uses the custom_metadata wrapper.
 
-For intentional errors, omit curl's -f so the JSON response can be inspected:
+Show the three intentional error cases:
 
 ~~~bash
-status=$(curl -sS -o "$DEMO_DIR/missing.json" -w '%{http_code}' \
-    "$API/api/v1/objects/does-not-exist")
-[[ "$status" == 404 ]]
-jq . "$DEMO_DIR/missing.json"
-
-status=$(curl -sS -D "$DEMO_DIR/method.headers" -o "$DEMO_DIR/method.json" \
-    -w '%{http_code}' -X PUT "$API/api/v1/objects/$OBJECT_ID")
-[[ "$status" == 405 ]]
-cat "$DEMO_DIR/method.headers"
-jq . "$DEMO_DIR/method.json"
-
-status=$(curl -sS -o "$DEMO_DIR/invalid.json" -w '%{http_code}' \
-    -X PATCH -H 'Content-Type: application/json' \
-    -d '{"custom_metadata":{"owner":123}}' "$API/api/v1/objects/$OBJECT_ID/metadata")
-[[ "$status" == 400 ]]
-jq . "$DEMO_DIR/invalid.json"
+demo_errors
 ~~~
 
-**Show:** meaningful JSON errors and an Allow header on 405.
+**Expected:** JSON errors for a missing object (404), unsupported method (405,
+with an Allow header), and a non-string metadata value (400).
 
-## 6. Stop a worker, download through failover, and restore replication
+## 6. Stop a worker and watch repair
 
-Choose a worker that definitely holds a replica of the main object.
+Pick a worker holding one of the main object's replicas, then stop it:
 
 ~~~bash
 VICTIM=$(meta | jq -r '.chunks[0].replicas[0]')
-printf 'Stopping %s\n' "$VICTIM"
 dc stop "$VICTIM"
 
-curl -fsS --max-time 45 "$API/api/v1/objects/$OBJECT_ID" -o "$DEMO_DIR/worker-down.bin"
-cmp "$DEMO_DIR/original.bin" "$DEMO_DIR/worker-down.bin"
-
-worker_unavailable() {
-    curl -fsS "$API/internal/workers" |
-        jq -e --arg id "$VICTIM" \
-            'any(.workers[]; .worker_id == $id and .status == "unavailable")' >/dev/null
-}
-wait_for "heartbeat failure detected" worker_unavailable
+check_download worker-down
+wait_for "worker failure detected" worker_unavailable
 curl -fsS "$API/internal/workers" | jq .
+~~~
 
-wait_for "replication restored on the three running workers" verify_replicas "$VICTIM"
+**Expected:** the download still matches, and the stopped worker becomes
+unavailable after more than six seconds without contact.
+
+Wait for new replicas on the remaining workers, then bring the old worker back:
+
+~~~bash
+wait_for "replication restored without the stopped worker" verify_replicas "$VICTIM"
 meta | jq '.chunks[] | {chunk_id, replicas}'
 
 dc start "$VICTIM"
 wait_for "returning worker healthy" all_healthy
-wait_for "returning worker stale copies reconciled" verify_replicas
+wait_for "stale extra copies removed" verify_replicas
 ~~~
 
-**Show:** download succeeds while one replica is unavailable; repair places a new
-copy on a spare worker. After the old worker returns, reconciliation removes
-extra copies until each chunk again has exactly two physical replicas.
-Detection takes over six seconds without contact; repair runs every 15 seconds,
-plus HTTP request time. The waits observe completion rather than promise an
-exact repair time.
+**Expected:** every chunk again has two verified copies. Repair uses a spare
+worker while the victim is down, then removes stale extra copies when it returns.
+The repair loop runs every 15 seconds; the checks wait for the result.
 
-## 7. Corrupt a replica and verify detection and repair
+## 7. Corrupt a replica and watch recovery
 
-Select a current recorded replica. This intentionally modifies only a chunk in
-this isolated demo's volume; the original file remains in DEMO_DIR.
+Select a recorded replica. Overwrite its first four bytes without changing its
+length; this exercises checksum detection.
 
 ~~~bash
 CHUNK_ID=$(meta | jq -r '.chunks[0].chunk_id')
 CORRUPT_WORKER=$(meta | jq -r '.chunks[0].replicas[0]')
-EXPECTED_CHUNK_SHA=$(meta | jq -r '.chunks[0].checksum')
+EXPECTED_SHA=$(meta | jq -r '.chunks[0].checksum')
 
 dc exec -T "$CORRUPT_WORKER" sh -c \
     'printf "\377\377\377\377" | dd of="$1" bs=1 count=4 conv=notrunc 2>/dev/null' \
     sh "/data/chunks/$CHUNK_ID"
 
-ACTUAL_CHUNK_SHA=$(dc exec -T "$CORRUPT_WORKER" sha256sum "/data/chunks/$CHUNK_ID")
-ACTUAL_CHUNK_SHA="${ACTUAL_CHUNK_SHA%% *}"
-printf 'Expected: %s\nCorrupted: %s\n' "$EXPECTED_CHUNK_SHA" "$ACTUAL_CHUNK_SHA"
-[[ "$ACTUAL_CHUNK_SHA" != "$EXPECTED_CHUNK_SHA" ]]
+ACTUAL_SHA=$(dc exec -T "$CORRUPT_WORKER" sha256sum "/data/chunks/$CHUNK_ID" | cut -d ' ' -f 1)
+echo "Expected:  $EXPECTED_SHA"
+echo "Corrupted: $ACTUAL_SHA"
+[[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]
 
-curl -fsS "$API/api/v1/objects/$OBJECT_ID" -o "$DEMO_DIR/corrupt-replica.bin"
-cmp "$DEMO_DIR/original.bin" "$DEMO_DIR/corrupt-replica.bin"
-wait_for "corruption repaired to two verified physical replicas" verify_replicas
-dc logs --no-color --tail 50 controller
+check_download corrupt-replica
+wait_for "two valid replicas restored" verify_replicas
+dc logs --no-color --tail 30 controller
 ~~~
 
-**Show:** the physical file has a different SHA-256 but the client still receives
-the original bytes. Logs show the invalid replica and repair. Repair may run
-before the download reaches that replica; either path detects the bad copy.
-The same-length overwrite exercises checksum checking rather than only a length
-mismatch.
+**Expected:** the physical replica's hash changes, but the download still matches.
+Logs show detection and repair. Repair may fix the replica before the download
+reaches it; either way, the valid copy protects the object.
 
-## 8. Persist data across controller crash and container recreation
+## 8. Prove SQLite and worker volumes survive restarts
+
+Save metadata, kill the controller, and start it again:
 
 ~~~bash
 meta > "$DEMO_DIR/before-restart.json"
 
 dc kill -s SIGKILL controller
 dc start controller
-wait_for "workers re-registered after controller crash" all_healthy
-wait_for "object API ready after controller crash" api_ready
+wait_for "workers re-registered" all_healthy
+wait_for "controller ready" api_ready
 
-meta > "$DEMO_DIR/after-restart.json"
-cmp <(jq -S . "$DEMO_DIR/before-restart.json") <(jq -S . "$DEMO_DIR/after-restart.json")
-curl -fsS "$API/api/v1/objects/$OBJECT_ID" -o "$DEMO_DIR/after-crash.bin"
-cmp "$DEMO_DIR/original.bin" "$DEMO_DIR/after-crash.bin"
-
-dc down
-dc up -d --wait
-wait_for "recreated containers healthy" all_healthy
-wait_for "recreated controller ready" api_ready
-curl -fsS "$API/api/v1/objects/$OBJECT_ID" -o "$DEMO_DIR/recreated.bin"
-cmp "$DEMO_DIR/original.bin" "$DEMO_DIR/recreated.bin"
-wait_for "physical replicas survived container recreation" verify_replicas
-meta | jq '{object_id, custom_metadata, checksum, created_at, last_modified}'
+check_metadata_persisted
+check_download after-crash
 ~~~
 
-**Show:** SQLite survives SIGKILL, custom metadata survives, and named volumes
-preserve chunks even when containers are removed. Do not add -v to dc down here:
-that would destroy the demo's data.
+**Expected:** the full metadata snapshot and downloaded bytes are unchanged.
+
+Now remove and recreate the containers while keeping their volumes:
+
+~~~bash
+dc down
+dc up -d --wait
+wait_for "recreated workers healthy" all_healthy
+wait_for "recreated controller ready" api_ready
+
+check_download recreated
+wait_for "physical replicas persisted" verify_replicas
+meta | jq '{object_id, custom_metadata, checksum}'
+~~~
+
+**Expected:** object data and custom metadata survive container recreation.
+**Do not add -v to dc down here:** that would delete the volumes.
 
 ## 9. GC dry-run
 
-Seed two orphan replicas with a controller-format chunk name. This is an explicit
-crash-state fixture representing files published without an object metadata
-commit; it does not claim that we interrupted a real upload at that instant.
-The upload failure boundary is exercised by the automated tests.
+Create two orphan files: chunk files with no owning object metadata. This is a
+controlled crash-state fixture, not a claim that a real upload was interrupted
+at that exact point. Automated tests cover the upload failure boundary.
 
 ~~~bash
 ORPHAN_CHUNK=obj-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-0
@@ -388,191 +265,166 @@ for w in worker1 worker2; do
     dc exec -T "$w" sh -c 'printf orphan > "$1"' sh "/data/chunks/$ORPHAN_CHUNK"
 done
 ORPHAN_OWNER="${ORPHAN_CHUNK%-0}"
-status=$(curl -sS -o "$DEMO_DIR/orphan-metadata.json" -w '%{http_code}' \
-    "$API/api/v1/objects/$ORPHAN_OWNER/metadata")
-[[ "$status" == 404 ]]
+expect_http 404 "$API/api/v1/objects/$ORPHAN_OWNER/metadata"
+~~~
 
+Request a dry-run. The arguments are mode, grace period, and worker-wait timeout:
+
+~~~bash
 dc stop controller
 request_gc dry-run 5s 60s
 dc start controller
 
-wait_for "maintenance rejects object requests" maintenance_active
-cat "$DEMO_DIR/maintenance.headers"
-jq . "$DEMO_DIR/maintenance.json"
-curl -fsS "$API/internal/workers" | jq .
+show_maintenance
+finish_gc
 
-wait_for "dry-run completed" api_ready
-dc exec -T controller sh -c 'test ! -e /data/gc.request'
 for w in worker1 worker2; do
     dc exec -T "$w" sha256sum "/data/chunks/$ORPHAN_CHUNK"
 done
-dc logs --no-color --tail 40 controller
+dc logs --no-color --tail 20 controller
 ~~~
 
-**Show:** object requests receive JSON 503 with Retry-After while membership
-remains available. Logs report two candidates and zero deleted bytes. Both
-orphan files remain. Successful dry-run consumes only its own request; it never
-authorizes a later destructive run.
+**Expected:** object APIs temporarily return JSON 503 with Retry-After, while
+membership still responds. Logs show two candidates, zero deletions, and zero
+reclaimed bytes. Both orphan files remain; the completed request file is removed.
 
-The request file accepts mode, grace_period, and worker_wait_timeout. The defaults
-are dry-run and 60 seconds for both durations; an empty request is a dry-run.
-Production-sized grace periods can be longer than the shortened demo settings.
+These are shortened demo timings. Defaults are dry-run, a 60-second grace period,
+and a 60-second worker-wait timeout. An empty request file also means dry-run.
 
-## 10. Requested deletion, late worker, and interrupted-GC recovery
+## 10. Delete orphans and recover interrupted GC
 
-Keep worker4 stopped so GC waits for registration. This provides a visible
-maintenance window without depending on catching a particular instant in a
-short grace period. Complete these steps within the five-minute discovery timeout.
+Stop worker4 so GC must wait. This creates a predictable maintenance window.
+Complete the next block within the five-minute worker-wait timeout.
 
 ~~~bash
 dc stop controller worker4
 request_gc delete 5s 300s
 dc start controller
 
-wait_for "requested GC waiting for the fourth worker" maintenance_active
+show_maintenance
 dc exec -T controller cat /data/gc.request
-curl -fsS "$API/internal/workers" | jq .
+~~~
 
+Kill the controller while its request is pending, then restart it and the worker:
+
+~~~bash
 dc kill -s SIGKILL controller
 dc start controller
-wait_for "interrupted GC request resumed" maintenance_active
+show_maintenance
 dc exec -T controller cat /data/gc.request
 
 dc start worker4
 wait_for "late worker registered" all_healthy
-wait_for "destructive GC completed" api_ready
+finish_gc
+~~~
 
-dc exec -T controller sh -c 'test ! -e /data/gc.request'
+Verify that the two orphan files disappeared and the committed object survived:
+
+~~~bash
 for w in worker1 worker2; do
     dc exec -T "$w" sh -c 'test ! -e "$1"' sh "/data/chunks/$ORPHAN_CHUNK"
 done
-dc logs --no-color --tail 70 controller
-curl -fsS "$API/api/v1/objects/$OBJECT_ID" -o "$DEMO_DIR/after-gc.bin"
-cmp "$DEMO_DIR/original.bin" "$DEMO_DIR/after-gc.bin"
-wait_for "GC preserved the committed object's replicas" verify_replicas
+dc logs --no-color --tail 25 controller
+check_download after-gc
+wait_for "committed replicas preserved" verify_replicas
 ~~~
 
-**Show:** the request survives SIGKILL, a late worker is included, and GC reclaims
-two six-byte files (12 estimated bytes). The committed object remains intact.
-A missing worker, failed inventory, SQLite error, or a newly observed orphan
-without a full grace period fails the pass and retains the request. Docker may
-restart and retry that outstanding request.
+**Expected:** the request survives SIGKILL, includes the late worker, and reclaims
+two six-byte orphan files: **12 estimated bytes**. Normal object data is preserved.
 
-To prove a completed request does not run on ordinary restart/reconnect:
+Finally, show that ordinary restarts and worker reconnects do not request GC:
 
 ~~~bash
-GC_REQUESTS_BEFORE=$(dc logs --no-color controller |
-    jq -Rs '[splits("\n") | select(contains("gc: requested"))] | length')
-
+RUNS_BEFORE=$(gc_request_count)
 dc restart controller
-wait_for "ordinary restart healthy" all_healthy
-wait_for "ordinary restart ready" api_ready
+wait_for "controller workers healthy" all_healthy
+wait_for "controller ready" api_ready
 dc restart worker1
-wait_for "worker reconnect healthy" all_healthy
-
-GC_REQUESTS_AFTER=$(dc logs --no-color controller |
-    jq -Rs '[splits("\n") | select(contains("gc: requested"))] | length')
-[[ "$GC_REQUESTS_BEFORE" == "$GC_REQUESTS_AFTER" ]]
-printf 'GC request count stayed at %s.\n' "$GC_REQUESTS_AFTER"
+wait_for "reconnected worker healthy" all_healthy
+check_gc_not_repeated "$RUNS_BEFORE"
 ~~~
 
-## 11. Incomplete deletion, persistent tombstones, and explicit retry
+## 11. Delete with a worker down, then retry
 
-Stop a replica worker before deleting the main object. Expected failure responses
-are captured without curl -f.
+Stop a replica worker and attempt deletion:
 
 ~~~bash
 VICTIM=$(meta | jq -r '.chunks[0].replicas[0]')
 dc stop "$VICTIM"
 
-status=$(curl -sS -X DELETE -o "$DEMO_DIR/delete-pending.json" -w '%{http_code}' \
-    "$API/api/v1/objects/$OBJECT_ID")
-[[ "$status" == 503 ]]
-jq . "$DEMO_DIR/delete-pending.json"
-
-curl -fsS "$API/api/v1/objects" |
-    jq -e --arg id "$OBJECT_ID" 'all(.objects[]; .object_id != $id)'
-
-dc restart controller
-wait_for "object listing available with one worker down" api_ready
-status=$(curl -sS -o "$DEMO_DIR/tombstone.json" -w '%{http_code}' \
-    "$API/api/v1/objects/$OBJECT_ID/metadata")
-[[ "$status" == 503 ]]
-jq . "$DEMO_DIR/tombstone.json"
-
-dc start "$VICTIM"
-wait_for "all workers returned for deletion retry" all_healthy
+expect_http 503 "$API/api/v1/objects/$OBJECT_ID" -X DELETE
+check_object_hidden
 ~~~
 
-**Show:** deletion made progress on reachable workers but retained its tombstone.
-The object is hidden from listing, and the deletion state survived restart.
-Background repair does not resurrect the object or finish its deletion.
+**Expected:** deletion removes reachable copies but returns 503 and retains a
+tombstone: a saved "deletion in progress" record. The object disappears from listing.
 
-Also prove GC preserves the pending deletion instead of mistaking it for an orphan:
+Restart the controller to prove that this deletion state is persistent:
+
+~~~bash
+dc restart controller
+wait_for "object listing available" api_ready
+expect_http 503 "$API/api/v1/objects/$OBJECT_ID/metadata"
+
+dc start "$VICTIM"
+wait_for "all workers returned" all_healthy
+~~~
+
+Before retrying DELETE, show that GC preserves the incomplete deletion:
 
 ~~~bash
 dc stop controller
 request_gc delete 2s 60s
 dc start controller
-wait_for "GC finished with a deletion tombstone present" api_ready
-wait_for "workers healthy after maintenance" all_healthy
+finish_gc
+wait_for "workers healthy" all_healthy
 
-status=$(curl -sS -o "$DEMO_DIR/tombstone-after-gc.json" -w '%{http_code}' \
-    "$API/api/v1/objects/$OBJECT_ID/metadata")
-[[ "$status" == 503 ]]
-jq . "$DEMO_DIR/tombstone-after-gc.json"
-dc logs --no-color --tail 35 controller
-
-status=$(curl -sS -X DELETE -o "$DEMO_DIR/delete-complete.body" -w '%{http_code}' \
-    "$API/api/v1/objects/$OBJECT_ID")
-[[ "$status" == 204 ]]
-[[ ! -s "$DEMO_DIR/delete-complete.body" ]]
-printf 'Explicit deletion retry returned %s with no body.\n' "$status"
-
-status=$(curl -sS -o "$DEMO_DIR/deleted.json" -w '%{http_code}' \
-    "$API/api/v1/objects/$OBJECT_ID")
-[[ "$status" == 404 ]]
-jq . "$DEMO_DIR/deleted.json"
+expect_http 503 "$API/api/v1/objects/$OBJECT_ID/metadata"
+dc logs --no-color --tail 15 controller
 ~~~
 
-## 12. Delete remaining objects and verify physical cleanup
+**Expected:** GC preserves the tombstoned chunks. Repair does not resurrect the
+object or automatically finish deletion.
+
+Now explicitly retry DELETE:
 
 ~~~bash
-while IFS= read -r id; do
-    status=$(curl -sS -X DELETE -o "$DEMO_DIR/boundary-delete.body" -w '%{http_code}' \
-        "$API/api/v1/objects/$id")
-    [[ "$status" == 204 ]]
-done < "$DEMO_DIR/boundary-ids.txt"
-
-curl -fsS "$API/api/v1/objects" | jq -e '.objects | length == 0'
-for w in worker1 worker2 worker3 worker4; do
-    inventory "$w" | jq -e '.chunks | length == 0'
-    dc exec -T "$w" ls -la /data/chunks
-done
+expect_http 204 "$API/api/v1/objects/$OBJECT_ID" -X DELETE
+expect_http 404 "$API/api/v1/objects/$OBJECT_ID"
 ~~~
 
-**Show:** no object metadata remains and every demo worker chunk directory is empty.
-Original files and downloaded evidence remain on the host in DEMO_DIR.
+**Expected:** deletion completes with no response body, and subsequent GET returns
+404.
 
-## 13. Clean up this demo project
+## 12. Verify all physical data was removed
 
-This step deliberately deletes **this demo project's volumes and stored data**.
-It does not address containers or volumes belonging to another Compose project.
+Delete the three boundary-test objects, then check every worker:
+
+~~~bash
+delete_boundary_objects
+check_empty_store
+~~~
+
+**Expected:** an empty object catalog and empty chunk directories on all four
+workers. Original files and downloaded evidence remain in DEMO_DIR.
+
+## 13. Clean up the demo deployment
+
+This deliberately deletes **only this demo project's containers and volumes**,
+including its stored data and local image tags:
 
 ~~~bash
 dc down -v --rmi local --remove-orphans
-printf 'Host evidence retained in %s\n' "$DEMO_DIR"
+echo "Host evidence remains in $DEMO_DIR"
 ~~~
 
-If you stop early, run this same cleanup command from the original terminal.
-The unique project name was printed in section 1 if you need to recover it.
-No global Docker prune or broad process-kill commands are needed.
+Use the same command if you stop the presentation early. The project name printed
+in step 1 lets you identify its resources if the original terminal is lost.
 
 ## 14. Automated verification
 
-These commands are separate from the manual presentation. Go 1.27.4 or later is
-required; the race detector also needs a working C compiler. Tests allocate their
-own temporary data and ports.
+These checks are separate from the presentation. They require Go 1.27.4 or later;
+the race detector also requires a working C compiler.
 
 ~~~bash
 go test ./... -v -count=1
@@ -580,24 +432,24 @@ go test -race ./... -count=1
 go vet ./...
 ~~~
 
-The opt-in tests exercise the real deployment, including controller crashes,
-worker repair, physical hashes, persistent tombstones, GC recovery, and ordinary
-restarts without GC. The Compose test uses another isolated project and removes
-its own containers and volumes afterward.
+Run the opt-in real-process and Docker integration tests:
 
 ~~~bash
 OBJECTSTORE_PROCESS_E2E=1 go test ./tests -run '^TestMultiProcess$' -v -count=1 -timeout=5m
 OBJECTSTORE_COMPOSE_KEEP=0 OBJECTSTORE_COMPOSE_E2E=1 go test ./tests -run '^TestComposeStack$' -v -count=1 -timeout=20m
 ~~~
 
-Internal chunk validation, lock lifetimes, forced metadata races, failed uploads,
-and cancellation are covered by these tests; the presentation does not pretend
-to reproduce every possible race manually.
+These tests include internal chunk validation, lock lifetimes, failed uploads,
+metadata races, cancellation, repair, persistence, and interrupted GC. Each
+integration test owns its temporary processes, ports, and data; the Compose test
+cleans its own project.
 
 ## Local development without Docker
 
-This is a separate startup option, not a continuation of the Docker walkthrough.
-Use free ports 8080–8084, or adjust every listen/advertise URL consistently.
+This is an alternative to the Docker walkthrough, not its next step.
+Use free ports 8080–8084, or adjust all listen and advertise URLs consistently.
+
+Build the binaries:
 
 ~~~bash
 mkdir -p tmp/bin
@@ -613,7 +465,7 @@ METADATA_DB_PATH=./data/controller/metadata.db \
 ./tmp/bin/controller
 ~~~
 
-In four other terminals, set i to 1, 2, 3, and 4 respectively:
+In four other terminals, run this with i set to 1, 2, 3, and 4:
 
 ~~~bash
 i=1
@@ -625,24 +477,44 @@ WORKER_ADVERTISE_URL="http://127.0.0.1:$((8080 + i))" \
 ./tmp/bin/worker
 ~~~
 
-Use Ctrl+C to stop these processes. Reuse each worker's identity and directory
-on restart. The client URLs then start with http://127.0.0.1:8080; Docker-specific
-helpers in the main walkthrough do not apply to this local mode.
+Use Ctrl+C to stop these processes. Reuse worker identities and directories on
+restart. Client URLs use http://127.0.0.1:8080; the Docker-specific helpers above
+do not apply in local mode.
 
-## Recovery if a GC request fails
+## Cancel a pending GC request
 
-This is an optional recovery action for a stack that is still running, not a
-step after cleanup. First inspect the controller logs and restore missing workers
-or database access. To cancel a pending request while keeping the data, stop the
-controller, remove only its request file with a volume helper, and start again:
+Use this only on a deployment you have not cleaned up. First inspect the logs
+and restore missing workers or SQLite access. If you choose to cancel the request:
 
 ~~~bash
 dc stop controller
 dc run --rm -T --no-deps --entrypoint rm controller /data/gc.request
 dc start controller
-wait_for "controller ready after cancelling GC" api_ready
+wait_for "controller ready after cancellation" api_ready
 ~~~
 
-Only use this if a request is present and you choose to cancel it. GC cannot
-automatically recognize a different but valid metadata database, so always use
-the database volume that belongs to these worker volumes.
+GC failures retain the request and stop the controller; Docker may retry it.
+Always use the SQLite volume belonging to these workers: GC cannot recognize
+a different but valid database as the wrong one.
+
+## What the helpers do
+
+The [helper source](scripts/demo_helpers.sh) is plain Bash and can be inspected.
+It performs the same checks as the longer original walkthrough.
+
+| Helper | Purpose |
+| --- | --- |
+| make_demo_files | Create random binary, empty, text, and exact-size input files |
+| meta / inventory | Fetch object metadata / one worker's chunk inventory |
+| check_download | Download the main object, compare bytes, and print its SHA-256 |
+| demo_boundaries / demo_parallel_downloads | Verify boundary-size uploads / four simultaneous downloads |
+| verify_replicas | Check two distinct placements, actual file hashes, and absence of extra replicas |
+| expect_http | Run a request, print its JSON/status, and verify the expected status; 204 must have no body |
+| request_gc | Atomically write the requested mode and timings into the controller volume |
+| show_maintenance / finish_gc | Show 503 and live membership / wait for API readiness and request-file removal |
+| check_metadata_persisted / check_metadata_patch | Verify the saved metadata snapshot / merged patch and unchanged checksum |
+| check_gc_not_repeated / check_object_hidden | Verify no new GC run / a tombstone hidden from listing |
+| delete_boundary_objects / check_empty_store | Delete the other demo objects / inspect the empty catalog and worker directories |
+
+Helper checks print OK only after passing. Waits have deadlines and print
+controller logs on timeout; they do not replace a failed check with a fixed sleep.

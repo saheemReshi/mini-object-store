@@ -278,7 +278,3 @@ controller crashes and interruption/recovery of requested GC.
   downloads into temporary files, so sufficient temporary disk space is required.
   Request reads have a two-minute deadline; shutdown allows 20 seconds to drain
   requests before force-closing active connections.
-
-See [REVIEW.md](REVIEW.md) for the earlier correctness review and persistence
-contract; the current code and tests include the subsequent SQLite and manual-GC
-additions described here.
